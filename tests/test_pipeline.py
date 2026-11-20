@@ -303,3 +303,24 @@ def test_camera_failure_falls_back(tmp_path, monkeypatch):
     s = Settings(methods="sift", accuracy="high", resolution=0.2, distortion=False, n_features=2000, jobs=2)
     proj, rep = run(src, tmp_path / "out", s, render=False)
     assert rep["aligned_images"] == 3
+
+
+def test_readjust_with_sequence_joins_blocks(tmp_path):
+    """A saved project split into groups is joined by `render --readjust --sequence`
+    without matching again."""
+    from mosaic2d import cli
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=7, n_rows=1, step=450, seed=2)
+    blank = src / "IMG_003.tif"
+    img = cv2.imread(str(blank), cv2.IMREAD_UNCHANGED)
+    cv2.imwrite(str(blank), np.full_like(img, int(img.mean())))
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False,
+                 n_features=3000, jobs=2, min_block=0)
+    proj, rep = run(src, tmp_path / "out", s, render=False)
+    assert rep["aligned_images"] < 7
+    pk = tmp_path / "out" / "mosaic_project.pkl"
+    assert cli.main(["render", str(pk), "--readjust", "--sequence", "-o", str(tmp_path / "out2"),
+                     "--resolution", "0.25", "--min-block", "0"]) in (0, None)
+    rep2 = json.loads((tmp_path / "out2" / "mosaic_report.json").read_text())
+    assert rep2["aligned_images"] == 7 and len(rep2["sequence_links"]) == 2

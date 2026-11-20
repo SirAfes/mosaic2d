@@ -288,6 +288,9 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
     return res
 
 
+MAX_TILT = np.radians(60.0)
+
+
 def _lm(prob, P, g, F, a_row, anchor_fix, href, logf0, focal_sigma, height_sigma, tilt_sig,
         robust_px, distortion, max_iter, k0=(0.0, 0.0), k_sigma=0.2):
     """Levenberg-Marquardt with Cauchy IRLS and per-photo priors."""
@@ -385,6 +388,11 @@ def _lm(prob, P, g, F, a_row, anchor_fix, href, logf0, focal_sigma, height_sigma
                 continue
             Pn = P + delta[:F * NP].reshape(F, NP)
             gn = g + delta[F * NP:]
+            # stay physical: no photo tilted beyond 60 deg (a fold / camera flipped over),
+            # focal length within 4x of the nominal one
+            if (np.hypot(Pn[:, 3], Pn[:, 4]).max() > MAX_TILT or abs(gn[0] - logf0) > np.log(4.0)):
+                lam *= 5
+                continue
             cn = total_cost(Pn, gn)
             if cn < cost:
                 rel = (cost - cn) / max(cost, 1e-12)

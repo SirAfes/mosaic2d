@@ -289,6 +289,33 @@ class Project:
     def _work_scale(self, w, h):
         return min(1.0, ACCURACY[self.s.accuracy] / max(w, h))
 
+    def _check_forced_band(self, band):
+        """A reference band given by hand: warn if it is clipped or black in this data set,
+        and name the band that would be better (saturation only, no matching)."""
+        try:
+            n = len(self.files)
+            idx = sorted({int(n * q) for q in (0.25, 0.5, 0.75)} & set(range(n)))
+            sample = [SR.load_frame(self.files[i], self.prof, self.s.demosaic) for i in idx]
+            stats = {}
+            for b in self.prof.bands:
+                valid = [None] * len(sample)
+                for k, fd in enumerate(sample):
+                    for bb in self.prof.bands:
+                        nz = BD.band_image(fd, bb) > 0
+                        valid[k] = nz if valid[k] is None else (valid[k] | nz)
+                sd = np.array([BD.band_saturation(BD.band_image(fd, b), v) for fd, v in zip(sample, valid)])
+                stats[b.name] = (float(np.median(sd[:, 0])), float(np.median(sd[:, 1])))
+        except Exception:                        # noqa: BLE001
+            return
+        sat, dark = stats[band.name]
+        if sat > 0.05 or dark > 0.3:
+            ok = [b for b in self.prof.bands if stats[b.name][0] < 0.01 and stats[b.name][1] < 0.1]
+            alt = min(ok, key=lambda b: abs((b.wavelength_nm or 550) - 550)).name if ok else None
+            self.log(f"  WARNING: reference band {band.name} (set by hand) is {sat * 100:.0f} % clipped "
+                     f"and {dark * 100:.0f} % black in this data set: few features, weak alignment."
+                     + (f" {alt} is not clipped; leave the field empty to choose automatically."
+                        if alt else ""))
+
     def _select_reference_band(self):
         prof = self.prof
         if len(prof.bands) == 1:
@@ -299,6 +326,7 @@ class Project:
             for b in prof.bands:
                 if b.name.lower().replace("nm", "").strip() == want:
                     self.ref_band = b
+                    self._check_forced_band(b)
                     return
             raise ValueError(f"Reference band '{self.s.ref_band}' not in profile: "
                              + ", ".join(b.name for b in prof.bands))
@@ -866,6 +894,18 @@ class Project:
                  f"k1={r.k[0]:+.4f} k2={r.k[1]:+.4f}, anchor {self.frames[r.anchor].path.name}")
         self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
 
+    def _check_camera(self, r):
+        """Reject a camera adjustment that ran into a non-physical corner."""
+        cam = r.camera or {}
+        f, f0 = cam.get("focal_px"), cam.get("focal_nominal_px")
+        if f and f0 and not (1 / 3 < f / f0 < 3):
+            raise ValueError(f"focal length {f:.0f} px is {f / f0:.2f} x the expected one")
+        tilts = list((cam.get("tilt_deg") or {}).values())
+        if tilts and max(tilts) > 60:
+            raise ValueError(f"a photo tilted {max(tilts):.0f} deg")
+        if not np.isfinite(r.median_px):
+            raise ValueError("no finite residuals")
+
     def _solve(self, nodes, corr, pairH, sizes, model, distortion, lens=None):
         """
         Bundle adjustment with a geometry check. Returns (result, model used).
@@ -899,22 +939,35 @@ class Project:
             f0, fsig, src = self.nominal_focal()
             self.log(f"  camera model: photos over one plane, shared lens f = {f0:.0f} px ({src}), "
                      f"heights +-{self.s.height_sigma:.0%}, tilt prior {self.s.tilt_sigma:g} deg")
-        try:
-            r = solve(nodes, model)
-        except Exception as e:                  # never leave the user without a mosaic
-            if model != "camera":
-                raise
-            self.log(f"  camera adjustment failed ({e}); using the homography model")
-            model = "homography"
-            r = solve(nodes, model)
+        # never leave the user without a mosaic: simpler models if one fails
+        chain = {"camera": ["camera", "homography", "similarity"],
+                 "homography": ["homography", "similarity"],
+                 "affine": ["affine", "similarity"]}.get(model, [model])
+        r, err = None, None
+        for k, mdl in enumerate(chain):
+            try:
+                r = solve(nodes, mdl)
+                if mdl == "camera":
+                    self._check_camera(r)
+                model = mdl
+                break
+            except Exception as e:              # noqa: BLE001
+                err = e
+                if k + 1 < len(chain):
+                    self.log(f"  {mdl} adjustment failed ({e}); trying the {chain[k + 1]} model")
+        if r is None:
+            raise RuntimeError(f"adjustment failed with every model: {err}")
         bad = self.degenerate_frames(r)
         if bad and model == "homography" and any(self._folds(r, i) for i in bad):
             # long chains: perspective terms are weakly constrained and can drift
             # until far frames fold over; the affine model cannot fold. Used only
             # if it is clearly better.
-            ra = solve(nodes, "affine")
-            bad_a = self.degenerate_frames(ra)
-            if len(bad_a) < len(bad) and ra.median_px <= 2.0 * r.median_px:
+            try:
+                ra = solve(nodes, "affine")
+                bad_a = self.degenerate_frames(ra)
+            except Exception:                   # noqa: BLE001
+                ra, bad_a = None, bad
+            if ra is not None and len(bad_a) < len(bad) and ra.median_px <= 2.0 * r.median_px:
                 self.log(f"  {len(bad)} frame(s) degenerate under the homography model; "
                          f"the affine model is better here ({len(bad_a)} degenerate, "
                          f"median {ra.median_px:.2f} px)")
@@ -934,7 +987,14 @@ class Project:
             if len(main) < len(kept):
                 self.log(f"  without them the main block splits; keeping its largest piece "
                          f"({len(main)} images), the others become separate groups")
-            r = solve(main, model)
+            try:
+                r2 = solve(main, model)
+                if model == "camera":
+                    self._check_camera(r2)
+            except Exception as e:              # noqa: BLE001
+                self.log(f"  adjustment of the reduced block failed ({e}); keeping the previous one")
+                break
+            r = r2
             bad = self.degenerate_frames(r)
         if bad:
             for i in bad:
@@ -1583,7 +1643,20 @@ def run(inputs, out_dir, settings: Settings | None = None, name="mosaic", render
     s = settings or Settings()
     proj = Project(inputs, out_dir, s)
     proj.ingest()
-    proj.align()
+    try:
+        proj.align()
+    except Exception:
+        # keep the (long) matching: the adjustment can be run again from the saved project
+        if proj.pairs:
+            pk = proj.out / f"{name}_project.pkl"
+            try:
+                proj.result = None
+                proj.save(pk)
+                proj.log(f"  adjustment failed; the matches are saved in {pk.name}. After fixing the "
+                         f"cause, continue without matching again: mosaic2d render \"{pk}\" --readjust")
+            except Exception:                   # noqa: BLE001
+                pass
+        raise
     proj._image_quality()
     proj.save(proj.out / f"{name}_project.pkl")
     proj.feats.clear()          # features are not needed any more; free memory for rendering

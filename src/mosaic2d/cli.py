@@ -157,6 +157,8 @@ def main(argv=None):
                             orient=args.orient, tile_size=args.tile_size, work_dir=args.work_dir,
                             seams=args.seams, deghost=args.deghost, gsd=args.gsd,
                             feather=args.feather, min_block=args.min_block)
+        if proj.result is None:              # saved after a failed adjustment: matches only
+            args.readjust = True
         if args.readjust:
             proj.s.model = args.model or "camera"
             if args.sequence:

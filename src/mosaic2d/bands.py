@@ -228,8 +228,8 @@ def choose_reference_band(frames_data: list, prof: CameraProfile, method,
 
     frames_data: FrameData of a sample of photos; ``groups`` lists runs of
     consecutive indices into it (default: all in one run). Every band of every
-    photo is matched with the next photo of its run; the score is the median
-    number of verified matches, reduced for clipped (saturated) pixels - clipped
+    photo is matched with the next photo of its run; the score is the mean
+    number of verified matches (times their spread), reduced for clipped (saturated) pixels - clipped
     areas carry no texture and no usable values - and for nearly black images.
     method: callable(img_u8) -> Features ; match_fn(fa, fb) -> PairResult
     Returns (best band, {band name: score}).
@@ -266,7 +266,9 @@ def choose_reference_band(frames_data: list, prof: CameraProfile, method,
                     continue
                 inl.append(rr.n_inliers * min(1.0, rr.coverage / 0.2) if rr.ok else 0.0)
         n_static[b.name] = stat
-        m = float(np.median(inl)) if inl else 0.0
+        # mean, not median: with a few runs, one bad stretch of the survey (blank water,
+        # a turn) would set every band to zero
+        m = float(np.mean(inl)) if inl else 0.0
         penalty = max(0.0, 1.0 - 10.0 * sat) * max(0.0, 1.0 - dark)
         scores[b.name] = round(m * penalty, 1)
         info[b.name] = (m, sat, dark)
@@ -287,6 +289,7 @@ def choose_reference_band(frames_data: list, prof: CameraProfile, method,
             f"(check the export / bit depth); they will be empty or flat in the mosaic too")
     if scores[best.name] <= 0:
         # nothing matched (e.g. a sample of blank photos): green-most band with least clipping
-        best = min(prof.bands, key=lambda b: (info[b.name][1] > 0.01, abs((b.wavelength_nm or 550) - 550)))
+        best = min(prof.bands, key=lambda b: (info[b.name][1] > 0.01 or info[b.name][2] > 0.3,
+                                               abs((b.wavelength_nm or 550) - 550)))
         log(f"  no band matched in the sample; using {best.name}")
     return best, scores

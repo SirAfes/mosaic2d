@@ -267,3 +267,39 @@ def test_lens_from_earlier_run(tmp_path):
     proj, rep = run(src, tmp_path / "b", s2, render=False)
     assert abs(rep["camera"]["focal_px"] / rep_a["camera"]["focal_px"] - 1) < 0.03
     assert "lens from mosaic_report.json" in (tmp_path / "b" / "mosaic2d.log").read_text()
+
+
+def test_failed_adjustment_keeps_matches_and_resumes(tmp_path, monkeypatch):
+    """A crash in the adjustment must not throw away hours of matching."""
+    from mosaic2d import cli
+    from mosaic2d.pipeline import Project
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=3, n_rows=1)
+    s = Settings(methods="sift", accuracy="high", resolution=0.2, distortion=False, n_features=2000, jobs=2)
+    orig = Project.adjust
+
+    def boom(self):
+        raise np.linalg.LinAlgError("Singular matrix")
+    monkeypatch.setattr(Project, "adjust", boom)
+    with pytest.raises(np.linalg.LinAlgError):
+        run(src, tmp_path / "out", s)
+    pk = tmp_path / "out" / "mosaic_project.pkl"
+    assert pk.is_file()
+    monkeypatch.setattr(Project, "adjust", orig)
+    assert cli.main(["render", str(pk), "-o", str(tmp_path / "out2"), "--resolution", "0.2"]) in (0, None)
+    assert (tmp_path / "out2" / "mosaic.tif").is_file()
+
+
+def test_camera_failure_falls_back(tmp_path, monkeypatch):
+    from mosaic2d import camera as CAMM
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=3, n_rows=1)
+
+    def boom(*a, **k):
+        raise np.linalg.LinAlgError("Singular matrix")
+    monkeypatch.setattr(CAMM, "run_camera_bundle", boom)
+    s = Settings(methods="sift", accuracy="high", resolution=0.2, distortion=False, n_features=2000, jobs=2)
+    proj, rep = run(src, tmp_path / "out", s, render=False)
+    assert rep["aligned_images"] == 3

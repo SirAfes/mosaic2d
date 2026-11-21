@@ -293,3 +293,38 @@ def choose_reference_band(frames_data: list, prof: CameraProfile, method,
                                                abs((b.wavelength_nm or 550) - 550)))
         log(f"  no band matched in the sample; using {best.name}")
     return best, scores
+
+
+# wavelengths that look like the red, green and blue of a screen (dominant wavelengths
+# of the sRGB primaries), and the range a band may come from
+RGB_TARGETS = ((611.0, (580.0, 690.0)), (549.0, (510.0, 580.0)), (464.0, (420.0, 500.0)))
+
+
+def natural_colour_bands(wavelengths, img=None):
+    """
+    (red, green, blue) band indices for a natural-colour view of a multispectral
+    image: for each screen primary the band nearest its wavelength (611 / 549 /
+    464 nm) among the bands that carry an image. Bands that are mostly black or
+    clipped in ``img`` (H x W x bands, optional) are skipped, so a dead 650 nm band
+    does not turn the picture cyan. Returns (indices, skipped band indices).
+    """
+    wl = [w or 0 for w in wavelengths]
+    n = len(wl)
+    usable = set(range(n))
+    if img is not None and img.ndim == 3 and img.shape[2] == n:
+        valid = (img > 0).any(axis=2)
+        for b in range(n):
+            sat, dark = band_saturation(np.ascontiguousarray(img[..., b]), valid)
+            if sat > 0.3 or dark > 0.5:
+                usable.discard(b)
+        if len(usable) < 3:
+            usable = set(range(n))
+    if not any(wl):                              # no wavelengths: spread over the band order
+        idx = (min(n - 1, int(round(0.7 * (n - 1)))), int(round(0.45 * (n - 1))), int(round(0.2 * (n - 1))))
+        return idx, sorted(set(range(n)) - usable)
+    chosen = []
+    for target, (lo, hi) in RGB_TARGETS:
+        cand = ([b for b in usable if lo <= wl[b] <= hi and b not in chosen]
+                or [b for b in usable if b not in chosen] or list(range(n)))
+        chosen.append(min(cand, key=lambda b: abs(wl[b] - target)))
+    return tuple(chosen), sorted(set(range(n)) - usable)

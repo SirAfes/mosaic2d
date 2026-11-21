@@ -2,6 +2,13 @@
 
 ## 0.3.0
 
+- Natural-colour previews of multispectral mosaics: the bands nearest the screen's red,
+  green and blue (611 / 549 / 464 nm) are used, skipping bands that are black or clipped
+  in the mosaic (the log names them). Wavelengths are also read from band names such as
+  "560 nm" when the file has no wavelength tags (the 8-bit Aran Island exports: the
+  preview had used band positions, and the reference band tie-break could not work).
+- `mosaic2d preview file.tif [...]`: natural-colour JPEG of finished mosaics, read from
+  the TIFF's overviews; `--bands 630,550,450` to choose, `--max-side` for the size.
 - Seamline feathering is written out while rendering, as soon as the last frame that can
   touch a part of the mosaic is done, one read and one write per row of tiles. Before,
   every feathered 32-px tile (14 bands, float32) was kept in memory until the end and

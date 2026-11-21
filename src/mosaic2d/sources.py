@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+import re
 from pathlib import Path
 
 import cv2
@@ -104,6 +105,18 @@ def profile_from_json(path) -> CameraProfile:
                          d.get("demosaic", "bilinear"), bands)
 
 
+def wavelength_from_name(name):
+    """Centre wavelength (nm) written in a band name ("560 nm", "B7_560nm",
+    "Band 6 (560)"), or None."""
+    if not name:
+        return None
+    m = (re.search(r"(\d{3,4}(?:\.\d+)?)\s*nm", name, re.I)
+         or re.search(r"(\d{3,4}(?:\.\d+)?)\s*\)?\s*$", name.strip()))
+    if m and 300 <= float(m.group(1)) <= 2500:
+        return float(m.group(1))
+    return None
+
+
 def get_profile(name_or_path: str, sample_file=None) -> CameraProfile:
     if name_or_path in ("rgb", "single"):
         return _rgb()
@@ -118,6 +131,8 @@ def get_profile(name_or_path: str, sample_file=None) -> CameraProfile:
         bands = []
         for k in range(c):
             name, wl = info.get(k, (None, None))
+            if wl is None and name:
+                wl = wavelength_from_name(name)
             if not name:
                 name = f"{wl:g} nm" if wl else f"band {k + 1}"
             bands.append(Band(name, 1, k, wl))

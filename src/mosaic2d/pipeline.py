@@ -427,7 +427,13 @@ class Project:
         S2 = np.diag([ss, ss, 1.0])
         bands = prof.output_bands()
         vis = []
-        for k in self.vis_channels():
+        if getattr(self, "_vis_auto", None) is None:
+            # skip bands that are black or clipped (decided once, on the first photo)
+            try:
+                self._vis_auto = self.vis_channels(np.dstack([SR.band_image(fd, b) for b in bands]))
+            except Exception:                       # noqa: BLE001 (lenses of different sizes)
+                self._vis_auto = self.vis_channels()
+        for k in self._vis_auto:
             b = bands[k]
             img = SR.band_image(fd, b).astype(np.float32)
             lh, lw = img.shape[:2]
@@ -1460,19 +1466,19 @@ class Project:
         RD.cleanup(rr)
         return img, rr
 
-    def vis_channels(self):
+    def vis_channels(self, img=None, log=False):
+        """Bands shown as red, green and blue in previews and seam maps
+        (multispectral: see bands.natural_colour_bands)."""
         bands = self.prof.output_bands()
         if self.prof.name == "rgb" or len(bands) == 3:
             return (0, 1, 2)
-        wl = [b.wavelength_nm or 0 for b in bands]
-        if not any(wl):                          # no wavelengths: spread over the band order
-            n = len(bands)
-            return (min(n - 1, int(round(0.7 * (n - 1)))), int(round(0.45 * (n - 1))),
-                    int(round(0.2 * (n - 1))))
-
-        def near(x):
-            return int(np.argmin([abs(w - x) for w in wl]))
-        return (near(650), near(550), near(450))
+        chosen, skipped = BD.natural_colour_bands([b.wavelength_nm for b in bands], img)
+        if log:
+            self.log(f"  preview colours: red {bands[chosen[0]].name}, green {bands[chosen[1]].name}, "
+                     f"blue {bands[chosen[2]].name}"
+                     + (f" (not used, black or clipped: {', '.join(bands[b].name for b in skipped)})"
+                        if skipped else ""))
+        return tuple(chosen)
 
     def render(self, name="mosaic"):
         t = time.time()
@@ -1492,7 +1498,7 @@ class Project:
                          blend=self.s.blend, work_dir=work / "_tmp_canvas", log=self.log,
                          flat=getattr(self, "flat", None), seams=self.s.seams,
                          deghost=self.s.deghost, feather=getattr(self.s, "feather", True),
-                         vis_bands=self.vis_channels(),
+                         vis_bands=getattr(self, "_vis_auto", None) or self.vis_channels(),
                          progress=lambda k, n: (k % 5 == 0 or k == n) and self.log(f"  rendered {k}/{n} frames"))
         prof = self.prof
 
@@ -1527,7 +1533,8 @@ class Project:
                        metadata=meta, pixel_size=ps, origin=(0.0, H * ps if ps else 0.0),
                        progress=wprog)
         small = RD.downsample(canvas, 3000)
-        cv2.imwrite(str(self.out / f"{name}_preview.jpg"), RD.visualise(small, self.vis_channels()),
+        vis = self.vis_channels(small, log=True)
+        cv2.imwrite(str(self.out / f"{name}_preview.jpg"), RD.visualise(small, vis),
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
         label, s = rr.seam_map(1600)
         self._save_seams(label, small, self.out / f"{name}_seams.jpg")
@@ -1552,7 +1559,7 @@ class Project:
         edges[:, 1:] |= label[:, 1:] != label[:, :-1]
         edges[1:, :] |= label[1:, :] != label[:-1, :]
         if small is not None:
-            base = cv2.resize(RD.visualise(small, self.vis_channels()), label.shape[::-1])
+            base = cv2.resize(RD.visualise(small, self.vis_channels(small)), label.shape[::-1])
             vis = cv2.addWeighted(base, 0.65, vis, 0.35, 0)
         vis[edges] = (255, 255, 255)
         for fr in self.frames:

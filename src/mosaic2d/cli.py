@@ -131,6 +131,13 @@ def build_parser():
     sub.add_parser("methods", help="list feature methods")
     g = sub.add_parser("gui", help="open a window for choosing folders and options")
     g.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    pv = sub.add_parser("preview", help="natural-colour JPEG of finished mosaics (multispectral too)")
+    pv.add_argument("files", nargs="+", help="mosaic TIFF(s)")
+    pv.add_argument("--max-side", type=int, default=4000, help="longest side of the JPEG in px")
+    pv.add_argument("--bands", default=None,
+                    help="bands for red,green,blue: wavelengths (630,550,450) or band numbers (9,6,3); "
+                         "default: nearest to the screen's red/green/blue, skipping black or clipped bands")
+    pv.add_argument("-o", "--out", default=None, help="output JPEG (one input file only)")
     v = sub.add_parser("view", help="view a mosaic (any TIFF, multispectral included): pick bands, zoom, pan")
     v.add_argument("file", nargs="?", default=None)
     v.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
@@ -146,6 +153,15 @@ def main(argv=None):
     if args.cmd == "gui":
         from .gui import main as gui_main
         return gui_main(selftest=args.selftest)
+    if args.cmd == "preview":
+        from .quicklook import make_preview
+        bands = args.bands.split(",") if args.bands else None
+        if bands and len(bands) != 3:
+            print("--bands needs three values (red,green,blue)")
+            return 2
+        for f in args.files:
+            make_preview(f, args.out if len(args.files) == 1 else None, args.max_side, bands)
+        return 0
     if args.cmd == "view":
         from .viewer import main as view_main
         return view_main(args.file, selftest=args.selftest)

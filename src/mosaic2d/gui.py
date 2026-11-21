@@ -197,6 +197,8 @@ class App:
         self.b_run.configure(state="disabled")
         self.b_open.configure(state="disabled")
         self.pb.start(12)
+        import time as _t
+        self._t0 = self._last_line_t = _t.time()
         self.v_status.set("Running... (this can take a while)")
         self.worker = threading.Thread(target=self._work, args=(argv,), daemon=True)
         self.worker.start()
@@ -218,12 +220,23 @@ class App:
             sys.stdout, sys.stderr = old
 
     def poll(self):
+        if self.worker is not None and self.worker.is_alive() and getattr(self, "_t0", None):
+            import time as _t
+            el = int(_t.time() - self._t0)
+            last = getattr(self, "_last_line_t", self._t0)
+            quiet = int(_t.time() - last)
+            msg = f"Running... {el // 3600} h {el % 3600 // 60:02d} min"
+            if quiet > 600:
+                msg += f" (last log line {quiet // 3600} h {quiet % 3600 // 60:02d} min ago)"
+            self.v_status.set(msg)
         try:
             while True:
                 item = self.q.get_nowait()
                 if isinstance(item, tuple):
                     self.finish(*item)
                 else:
+                    import time as _t
+                    self._last_line_t = _t.time()
                     self.log.insert("end", item)
                     self.log.see("end")
         except queue.Empty:

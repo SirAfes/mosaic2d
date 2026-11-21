@@ -2,6 +2,12 @@
 
 ## 0.3.0
 
+- Seamline feathering is written out while rendering, as soon as the last frame that can
+  touch a part of the mosaic is done, one read and one write per row of tiles. Before,
+  every feathered 32-px tile (14 bands, float32) was kept in memory until the end and
+  then written in random order: on the Aran Island sets the step after the last frame
+  ran for more than ten hours without a log line. Same output, byte for byte.
+- The window shows the elapsed time, and how long ago the last log line came.
 - Rendering speed on Windows: the canvas file is created sparse. Writing into a large
   memory-mapped file far from its start made NTFS zero-fill everything before that point;
   on the Aran Island multispectral sets (57 and 160 GB canvases) rendering slowed from

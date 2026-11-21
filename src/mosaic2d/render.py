@@ -160,11 +160,20 @@ class _SeamAccumulator:
     Sparse float accumulator for the narrow feathering band along seamlines.
     Only tiles the band touches are allocated, so memory stays proportional to
     the seam length, not to the canvas.
+
+    With ``last`` (per 32-px tile: the order number of the last frame whose
+    bounding box covers it) a tile is written out as soon as that frame is done,
+    instead of all at the end: memory stays bounded by the active part of the
+    mosaic (14 bands x float32 per tile adds up to many GB over a whole survey),
+    and the canvas is written where it is being worked on anyway.
     """
 
-    def __init__(self, n_bands: int, tile: int = 32):
+    def __init__(self, n_bands: int, tile: int = 32, last: np.ndarray | None = None):
         self.B, self.t = n_bands, tile
         self.tiles: dict = {}
+        self.last = last
+        self.pending: dict = {}
+        self.n_flushed = 0
 
     def add(self, oy: int, ox: int, mask: np.ndarray, vals: np.ndarray, w: np.ndarray):
         ys, xs = np.nonzero(mask)
@@ -181,36 +190,71 @@ class _SeamAccumulator:
             if k not in self.tiles:
                 self.tiles[k] = (np.zeros((self.t, self.t, self.B), np.float32),
                                  np.zeros((self.t, self.t), np.float32))
+                if self.last is not None:
+                    self.pending.setdefault(int(self.last[k]), []).append(k)
             acc, ws = self.tiles[k]
             ly, lx = gy[a:b] - k[0] * self.t, gx[a:b] - k[1] * self.t
             ww = w[ys[a:b], xs[a:b]]
             acc[ly, lx] += vals[ys[a:b], xs[a:b]] * ww[:, None]
             ws[ly, lx] += ww
 
-    def flush(self, out, maxv, dtype):
+    def _write(self, out, keys, maxv, dtype):
+        """Blend the given tiles into the canvas, one read and one write per tile row."""
         H, W = out.shape[:2]
-        for (ty, tx), (acc, ws) in self.tiles.items():
-            y0, x0 = ty * self.t, tx * self.t
-            h, w = min(self.t, H - y0), min(self.t, W - x0)
-            m = ws[:h, :w] > 1e-3
-            if not m.any():
-                continue
-            blk = np.array(out[y0:y0 + h, x0:x0 + w])
-            # The frame that owns a pixel outright (weight >= 0.998) wrote it
-            # directly and is not in the accumulator: it gets the weight the
-            # band frames leave over, so a lone minor contribution cannot take
-            # the pixel over.
-            a = acc[:h, :w][m]
-            s = ws[:h, :w][m]
-            cur = blk[m].astype(np.float32)
-            has = cur.max(axis=1) > 0
-            rest = np.where(has, np.maximum(1.0 - s, 0.0), 0.0)
-            v = (a + rest[:, None] * cur) / np.maximum(s + rest, 1e-6)[:, None]
-            blk[m] = np.clip(v, 1, maxv).astype(dtype)
-            out[y0:y0 + h, x0:x0 + w] = blk
-        n = len(self.tiles)
-        self.tiles = {}
-        return n
+        t = self.t
+        rows: dict = {}
+        for k in keys:
+            if k in self.tiles:
+                rows.setdefault(k[0], []).append(k[1])
+        for ty in sorted(rows):
+            txs = sorted(rows[ty])
+            y0 = ty * t
+            h = min(t, H - y0)
+            # runs of nearby tiles: one slice each (not one huge slice for two far tiles)
+            runs, start, prev = [], txs[0], txs[0]
+            for tx in txs[1:]:
+                if tx - prev > 64:
+                    runs.append((start, prev))
+                    start = tx
+                prev = tx
+            runs.append((start, prev))
+            for r0, r1 in runs:
+                xa, xb = r0 * t, min(W, (r1 + 1) * t)
+                band = np.array(out[y0:y0 + h, xa:xb])
+                for tx in txs:
+                    if tx < r0 or tx > r1:
+                        continue
+                    acc, ws = self.tiles.pop((ty, tx))
+                    x0 = tx * t - xa
+                    w = min(t, W - tx * t)
+                    m = ws[:h, :w] > 1e-3
+                    if not m.any():
+                        continue
+                    blk = band[:, x0:x0 + w]
+                    # The frame that owns a pixel outright (weight >= 0.998) wrote it
+                    # directly and is not in the accumulator: it gets the weight the
+                    # band frames leave over, so a lone minor contribution cannot take
+                    # the pixel over.
+                    a = acc[:h, :w][m]
+                    sw = ws[:h, :w][m]
+                    cur = blk[m].astype(np.float32)
+                    has = cur.max(axis=1) > 0
+                    rest = np.where(has, np.maximum(1.0 - sw, 0.0), 0.0)
+                    v = (a + rest[:, None] * cur) / np.maximum(sw + rest, 1e-6)[:, None]
+                    blk[m] = np.clip(v, 1, maxv).astype(dtype)
+                    self.n_flushed += 1
+                out[y0:y0 + h, xa:xb] = band
+
+    def flush_done(self, out, n, maxv, dtype):
+        """Write the tiles no frame after number n can touch."""
+        keys = self.pending.pop(n, None)
+        if keys:
+            self._write(out, keys, maxv, dtype)
+
+    def flush(self, out, maxv, dtype):
+        self._write(out, list(self.tiles), maxv, dtype)
+        self.pending = {}
+        return self.n_flushed
 
 
 def cleanup(renderer) -> None:
@@ -530,7 +574,16 @@ class Renderer:
         # 'disabled' keeps every pixel value exactly as in one source frame)
         feathering = (self.feather and self.blend == "mosaic" and self.seams is not None
                       and bool(self.seams.soft))
-        seam_acc = _SeamAccumulator(self.B) if feathering else None
+        seam_acc = None
+        if feathering:
+            # per 32-px tile: the last frame (in drawing order) whose box covers it
+            t = 32
+            last = np.full((-(-self.H // t), -(-self.W // t)), -1, np.int32)
+            for n_, fr in enumerate(self.frames):
+                x0, y0, x1, y1 = fr.bbox
+                if x1 > x0 and y1 > y0:
+                    last[max(0, y0) // t:(y1 - 1) // t + 1, max(0, x0) // t:(x1 - 1) // t + 1] = n_
+            seam_acc = _SeamAccumulator(self.B, t, last)
 
         step, block_w = 4, 512
         for n, fr in enumerate(self.frames):
@@ -610,6 +663,8 @@ class Renderer:
                         if band is not None:
                             seam_acc.add(oy, ox, band[r0:r1, c0:c1], vals, wf[r0:r1, c0:c1])
             del lenses
+            if seam_acc is not None:
+                seam_acc.flush_done(out, n, self.maxv, self.dtype)
             if self.progress:
                 self.progress(n + 1, len(self.frames))
         if seam_acc is not None:

@@ -165,6 +165,10 @@ def tiff_band_info(path) -> dict:
                     names[k] = v
                 elif key == "CENTRAL_WAVELENGTH_UM":
                     wls[k] = float(v) * 1000.0
+                elif key.upper() in ("WAVELENGTH_NM", "CENTRAL_WAVELENGTH_NM"):
+                    wls[k] = float(v)
+                elif key.upper() == "BAND_NAME" and v and k not in names:
+                    names[k] = v
                 elif key.lower() == "wavelength" and k not in wls:
                     wls[k] = float(v) * unit
             except ValueError:

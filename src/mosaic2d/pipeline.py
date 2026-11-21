@@ -65,6 +65,8 @@ class Settings:
     preselection: str = "auto"       # auto | sequential | generic | exhaustive
     window: int = 3                  # sequential neighbours
     sequence: bool = False           # photos in shooting order: neighbours matched harder, gaps bridged
+    sequence_max_gap: int = 3        # longest run of unmatched photos that is bridged
+    quick: bool = False              # fewer alternatives (see --quick)
     lens_from: str | None = None     # report.json / project.pkl of an earlier run: reuse its lens calibration
     distortion: bool = True          # self-calibrate radial distortion k1, k2
     ref_band: str | None = None      # e.g. "560 nm"; None = automatic
@@ -771,6 +773,10 @@ class Project:
                         res = r
                     if r.ok:
                         break
+                    # a handful of random inliers: the photos do not overlap (or one is
+                    # blurred); other feature methods do not change that and only cost time
+                    if res.n_inliers < 8 and len(tried) >= (2 if near else 1):
+                        break
             if (not res.ok and self.s.phasecorr and (j - i == 1 or (seq and j - i == 2))
                     and strategy != "single"):
                 r = MT.phase_correlation_pair(self.frames[i].reg, self.frames[j].reg, i, j)
@@ -778,7 +784,7 @@ class Project:
                 if r.ok:
                     res = r
             res.tried = tried
-            if res.ok and res.method != "phasecorr" and self.frames[i].reg is not None:
+            if res.ok and self.frames[i].reg is not None:
                 h_, w_ = self.frames[i].reg.shape[:2]
                 if BD._static(res, (w_, h_), 0.002):
                     # every match at the same image position: a pattern fixed to the camera
@@ -839,6 +845,25 @@ class Project:
         if not steps:
             return corr, pairH
         step = np.median(np.array(steps), axis=0)
+        # photos without any real match: bridged only in short runs (a blurred photo or
+        # two between good ones). Long runs (camera moving fast, turbid water, a turn)
+        # would be placed by dead reckoning over many steps - far off, a huge canvas and
+        # blurred content - so they are left out and the groups stay separate blocks.
+        matched = set()
+        for c in corr:
+            matched |= {c.i, c.j}
+        max_gap = int(getattr(self.s, "sequence_max_gap", 3))
+        excluded, k = set(), 0
+        while k < n:
+            if k in matched:
+                k += 1
+                continue
+            e = k
+            while e < n and e not in matched:
+                e += 1
+            if e - k > max_gap:
+                excluded |= set(range(k, e))
+            k = e
         parent = list(range(n))
 
         def root(a):
@@ -851,7 +876,7 @@ class Project:
         corr, pairH = list(corr), dict(pairH)
         for i in range(n - 1):
             j = i + 1
-            if root(i) == root(j):
+            if root(i) == root(j) or i in excluded or j in excluded:
                 continue
             w, h = sizes[i]
             g = np.array([[x, y] for x in np.linspace(0.1, 0.9, 5) * w for y in np.linspace(0.1, 0.9, 4) * h])
@@ -866,6 +891,12 @@ class Project:
             pairH[(i, j)] = T
             parent[root(i)] = root(j)
             self.sequence_links.append((i, j))
+        self.sequence_excluded = sorted(excluded)
+        if excluded:
+            ex = sorted(excluded)
+            self.log(f"  sequence: {len(ex)} photo(s) without any match in runs longer than {max_gap} "
+                     f"left out (blurred or no overlap): {self.frames[ex[0]].path.stem} ... "
+                     f"{self.frames[ex[-1]].path.stem}")
         if self.sequence_links:
             names = ", ".join(f"{self.frames[i].path.stem}-{self.frames[j].path.stem}"
                               for i, j in self.sequence_links[:10])
@@ -1162,29 +1193,49 @@ class Project:
             bad += [i for i, sc in scales.items() if sc > max_scale_ratio * med or sc < med / max_scale_ratio]
         return sorted(bad)
 
-    def estimated_pairs(self, min_overlap=0.12) -> list:
-        """Pairs whose adjusted footprints overlap but were never matched."""
+    def estimated_pairs(self, min_overlap=0.12, per_frame=8) -> list:
+        """Pairs whose adjusted footprints overlap but were never matched. Only photos
+        placed by real matches take part (not ones placed from the shooting order), and
+        each photo gets at most ``per_frame`` new pairs, those with the largest overlap
+        (a long strip placed slightly wrong could otherwise propose ten thousand pairs)."""
         r = self.result
         dist = RD.Distortion(r.k, r.center, r.radius)
+        measured = set()
+        for (i, j), pr in self.pairs.items():
+            if pr.ok:
+                measured |= {i, j}
         polys = {}
         for fr in self.frames:
-            if fr.index in r.H:
+            if fr.index in r.H and fr.index in measured:
                 rf = RD.RenderFrame(fr.index, str(fr.path), r.H[fr.index], fr.ref_size, fr.valid, {})
                 polys[fr.index] = cv2.convexHull(RD.footprint(rf, dist, 4).astype(np.float32))
-        new = []
+        cand = []
         keys = sorted(polys)
+        area = {k: max(cv2.contourArea(polys[k]), 1e-9) for k in keys}
+        boxes = {k: cv2.boundingRect(polys[k]) for k in keys}
         for a in range(len(keys)):
+            xa, ya, wa, ha = boxes[keys[a]]
             for b in range(a + 1, len(keys)):
                 i, j = keys[a], keys[b]
+                xb, yb, wb, hb = boxes[j]
+                if xb > xa + wa or xa > xb + wb or yb > ya + ha or ya > yb + hb:
+                    continue
                 if (i, j) in self.pairs:
                     continue
                 inter, _ = cv2.intersectConvexConvex(polys[i], polys[j])
                 if inter <= 0:
                     continue
-                frac = inter / min(cv2.contourArea(polys[i]), cv2.contourArea(polys[j]))
+                frac = inter / min(area[i], area[j])
                 if frac >= min_overlap:
-                    new.append((i, j))
-        return new
+                    cand.append((frac, i, j))
+        cand.sort(reverse=True)
+        count, new = {}, []
+        for frac, i, j in cand:
+            if count.get(i, 0) < per_frame and count.get(j, 0) < per_frame:
+                new.append((i, j))
+                count[i] = count.get(i, 0) + 1
+                count[j] = count.get(j, 0) + 1
+        return sorted(new)
 
     def align(self):
         """Steps 2-5 (features, pairs, matching, adjustment)."""
@@ -1193,7 +1244,7 @@ class Project:
         self.match(pairs)
         self.adjust()
         if self.s.preselection == "auto":
-            extra = self.estimated_pairs()
+            extra = self.estimated_pairs(per_frame=4 if getattr(self.s, "quick", False) else 8)
             if extra:
                 self.log(f"  estimated preselection: {len(extra)} additional overlapping pairs")
                 if self.match(extra, trusted=True):

@@ -37,7 +37,7 @@ class _QueueWriter:
 
 
 def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", height=None,
-               sequence=False, lens_from=None, ref_band=None):
+               sequence=False, lens_from=None, ref_band=None, quick=False):
     argv = ["run", str(inp), "--resolution", str(resolution), "--profile", profile,
             "--accuracy", accuracy, "--name", name]
     if height:
@@ -52,6 +52,8 @@ def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", he
         argv += ["--lens-from", str(lens_from)]
     if ref_band:
         argv += ["--ref-band", str(ref_band)]
+    if quick:
+        argv += ["--quick"]
     return argv
 
 
@@ -79,6 +81,7 @@ class App:
         self.v_seq = tk.BooleanVar(value=False)
         self.v_lens = tk.StringVar(value="")
         self.v_ref = tk.StringVar(value="")
+        self.v_quick = tk.BooleanVar(value=False)
         self.v_status = tk.StringVar(value="Choose the folder with the photos.")
 
         f = ttk.Frame(root, padding=10)
@@ -117,6 +120,9 @@ class App:
         ttk.Checkbutton(f, text="Photo series (sequence): file names in shooting order - match neighbours "
                                "harder and bridge gaps between consecutive photos",
                         variable=self.v_seq).grid(row=r, column=0, columnspan=3, sticky="w")
+        r += 1
+        ttk.Checkbutton(f, text="Quick: SIFT only and fewer extra pairs (much faster matching)",
+                        variable=self.v_quick).grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
         bar = ttk.Frame(f)
         bar.grid(row=r, column=0, columnspan=3, sticky="ew", pady=4)
@@ -184,7 +190,8 @@ class App:
         self.out_dir = Path(out)
         argv = build_argv(inp, out, res, self.v_prof.get(), self.v_acc.get(), self.v_tiles.get(),
                           self.v_name.get().strip() or "mosaic", height, self.v_seq.get(),
-                          self.v_lens.get().strip() or None, self.v_ref.get().strip() or None)
+                          self.v_lens.get().strip() or None, self.v_ref.get().strip() or None,
+                          self.v_quick.get())
         self.log.delete("1.0", "end")
         self.q.put("mosaic2d " + " ".join(argv) + "\n\n")
         self.b_run.configure(state="disabled")

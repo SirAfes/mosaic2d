@@ -324,3 +324,21 @@ def test_readjust_with_sequence_joins_blocks(tmp_path):
                      "--resolution", "0.25", "--min-block", "0"]) in (0, None)
     rep2 = json.loads((tmp_path / "out2" / "mosaic_report.json").read_text())
     assert rep2["aligned_images"] == 7 and len(rep2["sequence_links"]) == 2
+
+
+def test_sequence_leaves_out_long_runs_of_unmatched_photos(tmp_path):
+    """Four featureless photos in a row are not chained by dead reckoning: they are
+    left out and the two strips stay separate groups."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=9, n_rows=1, step=300, seed=2)
+    for k in (3, 4, 5, 6):
+        f = src / f"IMG_{k:03d}.tif"
+        img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+        cv2.imwrite(str(f), np.full_like(img, int(img.mean())))
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False,
+                 n_features=3000, jobs=2, min_block=0, sequence=True)
+    proj, rep = run(src, tmp_path / "out", s, render=False)
+    assert rep["sequence_links"] == []
+    assert sorted(proj.sequence_excluded) == [3, 4, 5, 6]
+    assert rep["aligned_images"] == 3

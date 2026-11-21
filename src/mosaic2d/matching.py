@@ -285,8 +285,11 @@ def phase_correlation_pair(img_a: np.ndarray, img_b: np.ndarray, i: int, j: int,
     bw = cv2.warpAffine(b, M, (w, h))
     valid = cv2.warpAffine(np.ones_like(b), M, (w, h)) > 0.99
     va, vb = a[valid], bw[valid]
-    ncc = float(np.corrcoef(va, vb)[0, 1]) if va.size > 100 else 0.0
-    if ncc < 0.3:
+    if va.size <= 100 or va.std() < 1e-3 * (abs(va.mean()) + 1) or vb.std() < 1e-3 * (abs(vb.mean()) + 1):
+        res.reason = "no texture for phase correlation"          # blank / empty photo
+        return res
+    ncc = float(np.corrcoef(va, vb)[0, 1])
+    if not np.isfinite(ncc) or ncc < 0.3:
         res.reason = f"NCC {ncc:.2f} at phase-correlation shift"
         return res
     x0, x1 = max(0, -dx), min(w, w - dx)

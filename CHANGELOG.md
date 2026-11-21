@@ -2,6 +2,21 @@
 
 ## 0.3.0
 
+- Rendering speed on Windows: the canvas file is created sparse. Writing into a large
+  memory-mapped file far from its start made NTFS zero-fill everything before that point;
+  on the Aran Island multispectral sets (57 and 160 GB canvases) rendering slowed from
+  ~9 s to ~2 min per photo as it went on (12-15 h in all). Unwritten canvas costs no disk.
+- Sequence mode bridges only short runs (<= 3) of photos without any match; longer runs
+  (camera moving fast, turbid water) are left out instead of being placed by dead
+  reckoning over dozens of steps, which had stretched the canvas to 184 000 x 62 000 px.
+- Phase correlation needs texture: blank photos no longer "match" each other with zero
+  shift, and zero-shift results are rejected like other matches fixed to the camera.
+- Matching: after a method finds only a handful of inliers (< 8: the photos do not
+  overlap) the cascade stops instead of trying up to six more methods. Extra pairs from
+  the adjusted footprints only for photos placed by real matches, at most 8 per photo
+  (one set had proposed 11 879 pairs, 111 matched).
+- `--quick` (checkbox in the window): SIFT only plus phase correlation for neighbours and
+  at most 4 extra pairs per photo.
 - Reference band (multispectral): photos from three places in the series (1/4, 1/2,
   3/4) instead of six consecutive middle ones; every band is scored by verified matches
   between consecutive photos times their spread, reduced for clipped (saturated) and

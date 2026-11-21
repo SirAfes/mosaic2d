@@ -519,11 +519,11 @@ class Renderer:
                  f"{need / 1e9:.2f} GB ({self.blend} blending)")
         canvas_path = self.work_dir / f"{out_name}.canvas"
         self.canvas_path = canvas_path
-        out = np.memmap(canvas_path, dtype=self.dtype, mode="w+", shape=shape)
+        out = sparse_memmap(canvas_path, self.dtype, shape)
         acc = wsum = None
         if self.blend == "average":
-            acc = np.memmap(self.work_dir / "acc.f32", np.float32, "w+", shape)
-            wsum = np.memmap(self.work_dir / "wsum.f32", np.float32, "w+", shape[:2])
+            acc = sparse_memmap(self.work_dir / "acc.f32", np.float32, shape)
+            wsum = sparse_memmap(self.work_dir / "wsum.f32", np.float32, shape[:2])
         if not self.gain and self.seams is None:
             self.prepare()
         # narrow feathering across optimised seamlines (two-band blending only;
@@ -648,6 +648,40 @@ class Renderer:
             best[m] = sc[m]
             label[m] = fr.index
         return label, s
+
+
+def _set_sparse(path) -> bool:
+    """Mark a file sparse on NTFS (Windows). Without this, writing into a large
+    memory-mapped canvas far from its start makes Windows zero-fill everything
+    before that point first: rendering slowed down from minutes to hours per 100
+    frames as it moved through a 50-160 GB canvas."""
+    if os.name != "nt":
+        return True                       # Linux / macOS: unwritten parts are holes already
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        FSCTL_SET_SPARSE = 0x000900C4
+        with open(path, "r+b") as fh:
+            h = msvcrt.get_osfhandle(fh.fileno())
+            ret = wintypes.DWORD()
+            ok = ctypes.windll.kernel32.DeviceIoControl(
+                wintypes.HANDLE(h), FSCTL_SET_SPARSE, None, 0, None, 0, ctypes.byref(ret), None)
+        return bool(ok)
+    except Exception:                     # noqa: BLE001 (FAT/exFAT, network drives)
+        return False
+
+
+def sparse_memmap(path, dtype, shape):
+    """Zero-initialised disk array that only occupies the parts written to."""
+    dtype = np.dtype(dtype)
+    size = int(np.prod(shape)) * dtype.itemsize
+    with open(path, "wb"):
+        pass
+    _set_sparse(path)
+    with open(path, "r+b") as fh:
+        fh.truncate(size)
+    return np.memmap(path, dtype=dtype, mode="r+", shape=tuple(shape))
 
 
 def downsample(arr, max_side=3000):

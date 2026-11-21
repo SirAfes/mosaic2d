@@ -27,6 +27,9 @@ def _add_common(p: argparse.ArgumentParser):
                    help="camera profile: auto, rgb, agrowing6, multiband or a JSON file")
     p.add_argument("--methods", default="auto",
                    help="feature methods in cascade order, e.g. sift,akaze,orb,fast (default: all available)")
+    p.add_argument("--quick", action="store_true",
+                   help="fewer alternatives: SIFT only (plus phase correlation for neighbours), "
+                        "fewer extra pairs; much faster matching, usually the same result")
     p.add_argument("--strategy", default="cascade", choices=["cascade", "union", "single"],
                    help="cascade: per pair, next method only if the previous failed; "
                         "union: pool matches of all methods; single: first method only")
@@ -174,6 +177,10 @@ def main(argv=None):
             proj.render_blocks(args.name)
         return 0
     known = {f.name for f in fields(Settings)}
+    if getattr(args, "quick", False):
+        if args.methods == "auto":
+            args.methods = "sift"
+        args.quick = True
     s = Settings(**{k: v for k, v in vars(args).items() if k in known and v is not None})
     out = Path(args.out) if args.out else Path(args.inputs[0]) / "mosaic2d"
     if args.cmd == "benchmark":

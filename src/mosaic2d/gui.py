@@ -37,7 +37,7 @@ class _QueueWriter:
 
 
 def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", height=None,
-               sequence=False, lens_from=None, ref_band=None, quick=False):
+               sequence=False, lens_from=None, ref_band=None, quick=False, max_gap=None):
     argv = ["run", str(inp), "--resolution", str(resolution), "--profile", profile,
             "--accuracy", accuracy, "--name", name]
     if height:
@@ -48,6 +48,8 @@ def build_argv(inp, out, resolution, profile, accuracy, tiles, name="mosaic", he
         argv += ["--tiles", "8192"]
     if sequence:
         argv += ["--sequence"]
+        if max_gap not in (None, "") and str(max_gap).strip().isdigit():
+            argv += ["--max-gap", str(int(max_gap))]
     if lens_from:
         argv += ["--lens-from", str(lens_from)]
     if ref_band:
@@ -82,6 +84,7 @@ class App:
         self.v_lens = tk.StringVar(value="")
         self.v_ref = tk.StringVar(value="")
         self.v_quick = tk.BooleanVar(value=False)
+        self.v_gap = tk.StringVar(value="3")
         self.v_status = tk.StringVar(value="Choose the folder with the photos.")
 
         f = ttk.Frame(root, padding=10)
@@ -117,9 +120,13 @@ class App:
         ttk.Entry(opts, textvariable=self.v_height, width=6).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(opts, text="8192 px tiles + .vrt", variable=self.v_tiles).pack(side="left")
         r += 1
-        ttk.Checkbutton(f, text="Photo series (sequence): file names in shooting order - match neighbours "
-                               "harder and bridge gaps between consecutive photos",
-                        variable=self.v_seq).grid(row=r, column=0, columnspan=3, sticky="w")
+        seqf = ttk.Frame(f)
+        seqf.grid(row=r, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(seqf, text="Photo series (sequence): file names in shooting order - match neighbours "
+                                  "harder and bridge gaps; place up to",
+                        variable=self.v_seq).pack(side="left")
+        ttk.Entry(seqf, textvariable=self.v_gap, width=5).pack(side="left", padx=4)
+        ttk.Label(seqf, text="unmatched photos in a row by order").pack(side="left")
         r += 1
         ttk.Checkbutton(f, text="Quick: SIFT only and fewer extra pairs (much faster matching)",
                         variable=self.v_quick).grid(row=r, column=0, columnspan=3, sticky="w")
@@ -191,7 +198,7 @@ class App:
         argv = build_argv(inp, out, res, self.v_prof.get(), self.v_acc.get(), self.v_tiles.get(),
                           self.v_name.get().strip() or "mosaic", height, self.v_seq.get(),
                           self.v_lens.get().strip() or None, self.v_ref.get().strip() or None,
-                          self.v_quick.get())
+                          self.v_quick.get(), self.v_gap.get().strip() or None)
         self.log.delete("1.0", "end")
         self.q.put("mosaic2d " + " ".join(argv) + "\n\n")
         self.b_run.configure(state="disabled")

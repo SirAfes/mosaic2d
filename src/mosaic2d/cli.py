@@ -50,6 +50,10 @@ def _add_common(p: argparse.ArgumentParser):
     p.add_argument("--preselection", default="auto",
                    choices=["auto", "sequential", "generic", "exhaustive"])
     p.add_argument("--window", type=int, default=3, help="sequential neighbours matched per image")
+    p.add_argument("--max-gap", type=int, default=3, dest="sequence_max_gap",
+                   help="with --sequence: longest run of photos without any match that is still "
+                        "placed by the shooting order (default 3; e.g. 1000 = place every photo, "
+                        "positions in long runs are then guesses)")
     p.add_argument("--lens-from", default=None, dest="lens_from",
                    help="report.json, project.pkl or output folder of an earlier run with the same "
                         "camera and housing: reuse its focal length and distortion instead of "
@@ -122,6 +126,8 @@ def build_parser():
                     help="with --readjust: transform model (default camera)")
     rr.add_argument("--sequence", action="store_true",
                     help="with --readjust: bridge gaps between consecutive photos (shooting order)")
+    rr.add_argument("--max-gap", type=int, default=None, dest="sequence_max_gap",
+                    help="with --readjust --sequence: longest run of unmatched photos placed by order")
     rr.add_argument("--lens-from", default=None, dest="lens_from",
                     help="with --readjust: reuse the lens calibration of an earlier run")
     rr.add_argument("--work-dir", default=None)
@@ -182,6 +188,8 @@ def main(argv=None):
             proj.s.model = args.model or "camera"
             if args.sequence:
                 proj.s.sequence = True
+            if args.sequence_max_gap is not None:
+                proj.s.sequence_max_gap = args.sequence_max_gap
             if args.lens_from:
                 proj.s.lens_from = args.lens_from
             proj.adjust()

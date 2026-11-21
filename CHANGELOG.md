@@ -2,6 +2,9 @@
 
 ## 0.3.0
 
+- `--max-gap N` (field next to "Photo series" in the window): longest run of photos
+  without any match that sequence mode still places by the shooting order (default 3).
+  A large value places every photo, as before, but positions inside long runs are guesses.
 - Natural-colour previews of multispectral mosaics: the bands nearest the screen's red,
   green and blue (611 / 549 / 464 nm) are used, skipping bands that are black or clipped
   in the mosaic (the log names them). Wavelengths are also read from band names such as

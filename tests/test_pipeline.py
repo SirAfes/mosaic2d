@@ -342,3 +342,23 @@ def test_sequence_leaves_out_long_runs_of_unmatched_photos(tmp_path):
     assert rep["sequence_links"] == []
     assert sorted(proj.sequence_excluded) == [3, 4, 5, 6]
     assert rep["aligned_images"] == 3
+
+
+PRESEL = "retrieval"
+
+
+def test_retrieval_joins_neighbouring_lanes(tmp_path, monkeypatch):
+    """Lawn-mower survey whose turns are featureless: the lanes only connect sideways.
+    The retrieval preselection (used for large series) finds the side-lap pairs."""
+    import mosaic2d.pipeline as PL
+    src = tmp_path / "src"
+    src.mkdir()
+    _survey(src, n_cols=9, n_rows=2, step=300, seed=3)       # zig-zag: 0-8, then 9-17 back
+    for k in range(5, 13):                                  # the turn: blank photos
+        f = src / f"IMG_{k:03d}.tif"
+        img = cv2.imread(str(f), cv2.IMREAD_UNCHANGED)
+        cv2.imwrite(str(f), np.full_like(img, int(img.mean())))
+    s = Settings(methods="sift", accuracy="high", resolution=0.25, distortion=False, n_features=3000,
+                 jobs=2, min_block=0, preselection=PRESEL)
+    proj, rep = run(src, tmp_path / "out", s, render=False)
+    assert rep["aligned_images"] == 10, rep["aligned_images"]

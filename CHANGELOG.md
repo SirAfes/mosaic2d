@@ -2,6 +2,15 @@
 
 ## 0.3.0
 
+- Large series (more than 600 photos): pairs between photos far apart in the series are
+  found by feature voting (every thumbnail feature votes for the photo its nearest
+  neighbour comes from; each photo's best partners are verified) instead of not being
+  tried at all. Neighbouring lanes of a lawn-mower survey and return passes now join
+  into one mosaic when they overlap sideways (`--preselection retrieval` to force it).
+- Flat field: the data area is where any band has data (a band that is black everywhere
+  had emptied it), and bands that are black, clipped or brighter in the corners than in
+  the centre are left uncorrected (Aran Island set: "corner/centre 1.93", a bright oval
+  painted into every photo).
 - `--max-gap N` (field next to "Photo series" in the window): longest run of photos
   without any match that sequence mode still places by the shooting order (default 3).
   A large value places every photo, as before, but positions inside long runs are guesses.

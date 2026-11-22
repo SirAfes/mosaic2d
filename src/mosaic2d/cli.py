@@ -48,7 +48,7 @@ def _add_common(p: argparse.ArgumentParser):
                    help="working resolution for matching (like Metashape's alignment accuracy)")
     p.add_argument("--features", type=int, default=8000, dest="n_features", help="key point limit per image")
     p.add_argument("--preselection", default="auto",
-                   choices=["auto", "sequential", "generic", "exhaustive"])
+                   choices=["auto", "sequential", "generic", "retrieval", "exhaustive"])
     p.add_argument("--window", type=int, default=3, help="sequential neighbours matched per image")
     p.add_argument("--max-gap", type=int, default=3, dest="sequence_max_gap",
                    help="with --sequence: longest run of photos without any match that is still "

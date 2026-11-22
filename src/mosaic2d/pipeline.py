@@ -62,7 +62,7 @@ class Settings:
     tilt_sigma: float = 15.0         # camera model: tilt from nadir (deg), prior width
     accuracy: str = "medium"         # working resolution for matching (max side px)
     n_features: int = 8000
-    preselection: str = "auto"       # auto | sequential | generic | exhaustive
+    preselection: str = "auto"       # auto | sequential | generic | retrieval | exhaustive
     window: int = 3                  # sequential neighbours
     sequence: bool = False           # photos in shooting order: neighbours matched harder, gaps bridged
     sequence_max_gap: int = 3        # longest run of unmatched photos that is bridged
@@ -548,15 +548,33 @@ class Project:
             h, w = fr.thumb.shape[:2]
             x0, y0, x1, y1 = [v * ts for v in fr.valid]
             yy, xx = np.mgrid[0:h, 0:w]
-            valids.append((xx >= x0) & (xx < x1) & (yy >= y0) & (yy < y1) & (fr.thumb.min(2) > 0))
+            # data area: any band non-zero (a band that is black everywhere must not empty it)
+            valids.append((xx >= x0) & (xx < x1) & (yy >= y0) & (yy < y1) & (fr.thumb.max(2) > 0))
             thumbs.append(fr.thumb)
         flat, stats = estimate_flatfield(thumbs, valids)
         if flat is None:
             self.log(f"  flat field not estimated: {stats}")
             return
         bands = self.prof.output_bands()
+        # bands that are black or clipped carry no illumination pattern, and corners
+        # brighter than the centre are not vignetting (clipping, a bright patch): leave
+        # those bands uncorrected instead of painting a pattern into every photo
+        skipped = []
+        sample = thumbs[:: max(1, len(thumbs) // 40)]
+        for b in list(stats):
+            vals = [BD.band_saturation(np.ascontiguousarray(t[..., b]), t.max(2) > 0) for t in sample]
+            sat, dark = np.median(np.array(vals), axis=0)
+            if sat > 0.2 or dark > 0.5 or stats[b] > 1.25:
+                flat[..., b] = 1.0
+                skipped.append(bands[b].name)
+                del stats[b]
+        if not stats:
+            self.log(f"  flat field not applied: no band with a usable illumination pattern")
+            return
         self.flat = flat
         self.flat_stats = {bands[b].name: v for b, v in stats.items()}
+        if skipped:
+            self.log(f"  flat field: not corrected (black, clipped or no falloff): {', '.join(skipped)}")
         worst = min(self.flat_stats.items(), key=lambda kv: kv[1])
         self.log(f"  flat field: corner/centre brightness {np.mean(list(stats.values())):.2f} on average "
                  f"(strongest falloff {worst[0]}: {worst[1]:.2f}); corrected in the mosaic")
@@ -717,6 +735,75 @@ class Project:
         self.timing["preselection_s"] = time.time() - t
         return {k: v for k, v in scores.items() if v > 0}
 
+    def retrieval_candidates(self, per_image=12, min_inliers=12) -> dict:
+        """
+        Overlapping pairs for large series without matching every pair: every
+        thumbnail feature votes for the photo its nearest neighbour (among all
+        other photos' features) comes from; each photo's best-voted partners are
+        then verified like the generic preselection. Finds the neighbouring lane of
+        a lawn-mower survey or a return pass, which sequential pairs never try.
+        """
+        t = time.time()
+        meth = "sift" if "sift" in self.registry and self.registry["sift"].available else self.methods[0]
+        small = []
+        for fr in self.frames:
+            s_ = min(1.0, 900.0 / max(fr.reg.shape))
+            small.append(cv2.resize(fr.reg, None, fx=s_, fy=s_, interpolation=cv2.INTER_AREA))
+        reg = FT.build_registry(1500)
+        feats = list(ThreadPoolExecutor(self.jobs).map(reg[meth].build, small))
+        n = len(self.frames)
+        # retrieval descriptors: RootSIFT of the 400 strongest features per photo
+        D, owner = [], []
+        for k, f in enumerate(feats):
+            d = f.desc
+            if d is None or len(d) == 0:
+                continue
+            d = np.asarray(d, np.float32)
+            if len(d) > 400:                                # evenly thinned (keeps the spread)
+                d = d[np.linspace(0, len(d) - 1, 400).astype(int)]
+            if f.norm == cv2.NORM_L2:
+                d = np.sqrt(np.abs(d) / (np.abs(d).sum(1, keepdims=True) + 1e-7))
+            D.append(d)
+            owner.append(np.full(len(d), k, np.int32))
+        votes = {}
+        if D:
+            D = np.concatenate(D)
+            owner = np.concatenate(owner)
+            fl = cv2.flann_Index(D, dict(algorithm=1, trees=4))
+            knn = 6
+            idx, dist = fl.knnSearch(D, knn + 1, params=dict(checks=64))
+            for q in range(len(D)):
+                me = owner[q]
+                cand = [(dist[q, c], owner[idx[q, c]]) for c in range(knn + 1) if owner[idx[q, c]] != me]
+                if len(cand) < 2:
+                    continue
+                (d1, o1), (d2, _) = cand[0], cand[1]
+                if d1 < 0.8 * 0.8 * d2:                     # squared L2: ratio 0.8
+                    key = (min(me, o1), max(me, o1))
+                    votes[key] = votes.get(key, 0) + 1
+        best = {}
+        for (i, j), v in votes.items():
+            if v >= 4:
+                best.setdefault(i, []).append((v, j))
+                best.setdefault(j, []).append((v, i))
+        pairs = set()
+        for i, lst in best.items():
+            for v, j in sorted(lst, reverse=True)[:per_image]:
+                pairs.add((min(i, j), max(i, j)))
+        p = MT.MatchParams(min_inliers=min_inliers, guided=False, ransac_px=3.0, min_coverage=0.003)
+
+        def m(ij):
+            i, j = ij
+            r = MT.match_pair(feats[i], feats[j], i, j, p)
+            return ij, (r.n_inliers if r.ok else 0)
+        with ThreadPoolExecutor(self.jobs) as ex:
+            scores = dict(ex.map(m, sorted(pairs)))
+        self.timing["preselection_s"] = time.time() - t
+        ok = {k: v for k, v in scores.items() if v > 0}
+        self.log(f"  retrieval preselection: {len(pairs)} likely pairs from feature votes, {len(ok)} confirmed "
+                 f"({sum(1 for i, j in ok if j - i > 6)} between photos far apart in the series)")
+        return ok
+
     def candidate_pairs(self) -> list:
         n = len(self.frames)
         mode = self.s.preselection
@@ -736,6 +823,10 @@ class Project:
             cand |= set(self.generic_scores)
             self.log(f"  generic preselection: {len(self.generic_scores)} overlapping pairs found "
                      f"among {n * (n - 1) // 2}")
+        elif mode in ("auto", "generic", "retrieval"):
+            # too many photos to try every pair on thumbnails: vote first, then verify
+            self.generic_scores = self.retrieval_candidates()
+            cand |= set(self.generic_scores)
         return sorted(cand)
 
     # ------------------------------------------------------------------ matching

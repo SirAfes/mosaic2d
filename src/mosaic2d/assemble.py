@@ -148,11 +148,35 @@ def _similarity(theta, scale, src, dst):
     return M
 
 
-def place_groups(groups, k=12, straight=False, log=print):
-    """Similarity (group pixels -> assembled pixels) for every group; the first stays as it is."""
+def _cells(points, M, cell):
+    """Occupied grid cells (set) of coverage points after the similarity M."""
+    q = points @ M[:2, :2].T + M[:2, 2]
+    return set(map(tuple, np.floor(q / cell).astype(np.int64)))
+
+
+def place_groups(groups, k=12, straight=False, log=print, cell=None):
+    """
+    Similarity (group pixels -> assembled pixels) for every group; the first
+    stays as it is.
+
+    With coverage points (``group["cover"]``: N x 2 group pixels where the group
+    has data) the placement also respects what the matching found: the groups
+    did not match each other, so they do not show the same seabed and should not
+    lie on top of each other. If the continued path puts a group onto an earlier
+    one, it is moved further along the path (more distance in the gap) or turned
+    a little, whichever needs the smallest change.
+    """
     px0 = groups[0]["px"] or 1.0
     groups[0]["M"] = np.eye(3)
     groups[0]["gap"] = 0
+    occupied = set()
+    if cell is None:
+        cell = 1.0
+        if all(g.get("cover") is not None for g in groups):
+            ext = max(np.ptp(g["cover"], axis=0).max() for g in groups)
+            cell = max(ext / 60.0, 1.0)
+    if groups[0].get("cover") is not None:
+        occupied |= _cells(groups[0]["cover"], groups[0]["M"], cell)
     for a, b in zip(groups, groups[1:]):
         ta = np.array(sorted(a["centres"]))
         Pa = np.array([a["centres"][i] for i in ta], np.float64)
@@ -161,17 +185,41 @@ def place_groups(groups, k=12, straight=False, log=print):
         if straight:
             rate = 0.0
         gap = b["first"] - a["last"]
-        p_pred, th_pred = continue_path(Pa[np.argmax(ta)], heading, step, rate, gap)
         tb = np.array(sorted(b["centres"]))
         Pb = np.array([b["centres"][i] for i in tb], np.float64)
         _, hb, _ = path_motion(Pb, tb, at_end=False, k=k)
         scale = (b["px"] or px0) / px0
-        b["M"] = _similarity(th_pred - hb, scale, Pb[0], p_pred)
+        best = None
+        extras = range(0, 31) if b.get("cover") is not None else (0,)
+        turns = (0, -10, 10, -20, 20, -30, 30, -45, 45) if b.get("cover") is not None else (0,)
+        for extra in extras:
+            p_pred, th_pred = continue_path(Pa[np.argmax(ta)], heading, step, rate, gap + extra)
+            for dt in turns:
+                M = _similarity(th_pred - hb + np.radians(dt), scale, Pb[0], p_pred)
+                if b.get("cover") is None:
+                    best = (0.0, extra, dt, M)
+                    break
+                cb = _cells(b["cover"], M, cell)
+                ov = len(cb & occupied) / max(len(cb), 1)
+                cost = ov + 0.01 * extra + 0.002 * abs(dt)
+                if best is None or cost < best[0]:
+                    best = (cost, extra, dt, M, ov)
+            if best is not None and len(best) > 4 and best[4] < 0.02 and extra >= best[1] + 3:
+                break
+        b["M"] = best[3]
         b["gap"] = int(gap - 1)
-        b["turn_deg"] = float(np.degrees(rate * gap))
-        log(f"  {b['tif'].name}: {gap - 1} photo(s) missing before it; path continued "
-            f"{'straight' if abs(np.degrees(rate)) < 0.5 else f'turning {np.degrees(rate):+.1f} deg per photo'}, "
-            f"step {step:.0f} px; group turned {np.degrees(th_pred - hb):+.1f} deg")
+        b["extra_steps"] = int(best[1])
+        b["extra_turn_deg"] = float(best[2])
+        if b.get("cover") is not None:
+            occupied |= _cells(b["cover"], b["M"], cell)
+        how = "straight" if abs(np.degrees(rate)) < 0.5 else f"turning {np.degrees(rate):+.1f} deg per photo"
+        msg = (f"  {b['tif'].name}: {gap - 1} photo(s) missing before it; path continued {how}, "
+               f"step {step:.0f} px")
+        if best[1] or best[2]:
+            msg += (f"; moved {best[1]} step(s) further" if best[1] else "") + \
+                   (f"; turned {best[2]:+.0f} deg more" if best[2] else "") + \
+                   " so that it does not lie on an earlier group (they did not match each other)"
+        log(msg)
     return groups
 
 
@@ -269,6 +317,17 @@ def assemble(out_dir, name=None, photos=None, out=None, k=12, straight=False, lo
         return None
     log(f"assembling {len(groups)} groups of {name} ({sum(g['images'] for g in groups)} photos) "
         f"along the camera path:")
+    from .viewer import TiffMosaic as _TM
+    for g in groups:                                   # where each group has data (coarse)
+        m = _TM(g["tif"])
+        ov, f = m.overview()
+        m.close()
+        ys, xs = np.nonzero((ov > 0).any(axis=2))
+        sel = np.linspace(0, len(xs) - 1, min(len(xs), 20000)).astype(int) if len(xs) else []
+        g["cover"] = np.column_stack([xs[sel], ys[sel]]).astype(np.float64) * f if len(xs) else None
+    if any(g["cover"] is None for g in groups):
+        for g in groups:
+            g["cover"] = None
     place_groups(groups, k=k, straight=straight, log=log)
     # bounds of the assembled image
     pts = []

@@ -2,6 +2,18 @@
 
 ## 0.3.0
 
+- Fix: in sequence mode, groups joined only by a "typical step" link could end up far
+  from where they belong (tens of thousands of pixels; Aran 3: RMSE 766 px, 30
+  consecutive photos placed far apart). The start of the adjustment chained pair
+  homographies, whose perspective terms add up along a long strip, and the robust
+  (Cauchy) loss then gave up on the weak link instead of moving the group. The start
+  is now chained in the adjustment's own model, and links are quadratic and never
+  rejected (`Correspondences.robust_px`). Aran 3, same matches: RMSE 8.9 px, every
+  link within 11 px. Saved projects are fixed by `render --readjust --sequence`.
+- `assemble`: a group is no longer put on top of an earlier one (they did not match,
+  so they do not show the same seabed): it is moved further along the path or turned
+  a little, whichever is the smaller change.
+
 - `mosaic2d assemble <output folder>` ("Assemble groups..." in the window): one image
   from the separate groups of a finished run, without matching or rendering photos
   again. The groups are taken in shooting order; from the last photos of a group the

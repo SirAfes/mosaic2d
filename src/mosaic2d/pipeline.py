@@ -983,7 +983,11 @@ class Project:
             if ok.sum() < 6:                        # typical step leaves no overlap: assume half a frame
                 q = g + step * (0.5 * min(w, h) / max(1e-6, float(np.hypot(*step))))
                 ok = (q[:, 0] > 0) & (q[:, 0] < wj) & (q[:, 1] > 0) & (q[:, 1] < hj)
-            corr.append(BA.Correspondences(i, j, g[ok], q[ok], 0.05, "sequence"))
+            # the only connection of a group: quadratic loss, so it holds the group
+            # wherever the group starts (links between photos that are connected
+            # otherwise were tried: where the swimmer sped up they pull matched
+            # geometry apart)
+            corr.append(BA.Correspondences(i, j, g[ok], q[ok], 0.05, "sequence", float("inf")))
             T = np.array([[1, 0, step[0]], [0, 1, step[1]], [0, 0, 1]], np.float64)
             pairH[(i, j)] = T
             parent[root(i)] = root(j)

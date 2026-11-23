@@ -97,6 +97,15 @@ def H_from_theta(th: np.ndarray, model: str) -> np.ndarray:
     return (c + M @ th).reshape(3, 3)
 
 
+# Tie points of these methods are assumptions, not measurements (sequence mode:
+# "consecutive photos are one typical step apart"), so they are never rejected.
+# Their loss is set per set of tie points (Correspondences.robust_px): a link that
+# is the only connection of a group is quadratic (inf) - a Cauchy loss would give
+# up on it as soon as the group hanging on it starts far off, and the group would
+# stay wherever it started - the others have a wide Cauchy loss.
+LINK_METHODS = ("sequence",)
+
+
 @dataclass
 class Correspondences:
     i: int
@@ -105,6 +114,7 @@ class Correspondences:
     q: np.ndarray       # N x 2, native px of image j
     weight: float = 1.0
     method: str = ""
+    robust_px: float = 0.0      # Cauchy scale (px); 0: the adjustment's, inf: quadratic
 
 
 @dataclass
@@ -245,8 +255,9 @@ class BundleAdjuster:
                 z = Y[:, 2:3]
                 proj = Y[:, :2] / z
                 r = (proj - Qu).ravel()
+                rob = float(getattr(c, "robust_px", 0.0) or 0.0)
                 if not need_jac:
-                    out.append((r, None, None, None, a, b, c.weight))
+                    out.append((r, None, None, None, a, b, c.weight, rob))
                     continue
                 n = len(P)
                 # d proj / dY : n x 2 x 3
@@ -273,14 +284,18 @@ class BundleAdjuster:
                     G = (Hb_inv @ Ha)[:, :2]                     # dY/dPu, 3 x 2
                     Jk = np.einsum("nij,jk,nkl->nil", dP, G, dPu) - du(Q)
                 out.append((r, Ja.reshape(-1, nk), Jb.reshape(-1, nk),
-                            None if Jk is None else Jk.reshape(-1, 2), a, b, c.weight))
+                            None if Jk is None else Jk.reshape(-1, 2), a, b, c.weight, rob))
         return out
 
+    def _c2(self, rob):
+        """Squared Cauchy scale (normalised units) of a set of tie points; inf: quadratic."""
+        return ((rob or self.robust_px) * self.s) ** 2
+
     def _cost(self, terms):
-        c2 = (self.robust_px * self.s) ** 2
         tot = 0.0
-        for (r, *_rest, w) in terms:
-            tot += w * 0.5 * c2 * np.log1p(r * r / c2).sum()
+        for (r, *_rest, w, rob) in terms:
+            c2 = self._c2(rob)
+            tot += w * 0.5 * ((r * r).sum() if np.isinf(c2) else c2 * np.log1p(r * r / c2).sum())
         return tot
 
     def solve(self, nodes, corr: list, init_H: dict, anchor: int, sizes: dict,
@@ -316,9 +331,8 @@ class BundleAdjuster:
         for it in range(1, iters + 1):
             A = np.zeros((npar, npar))
             g = np.zeros(npar)
-            c2 = (self.robust_px * self.s) ** 2
-            for (r, Ja, Jb, Jk, a, b, w) in terms:
-                wr = w / (1 + r * r / c2)          # Cauchy IRLS weights
+            for (r, Ja, Jb, Jk, a, b, w, rob) in terms:
+                wr = w / (1 + r * r / self._c2(rob))   # Cauchy IRLS weights (r / inf = 0: quadratic)
                 blocks = []
                 if idx_of[a] is not None:
                     blocks.append((idx_of[a], Ja))
@@ -427,11 +441,13 @@ def run_bundle(nodes: list, corr: list, pair_H: dict, sizes: dict, model="homogr
     thin = []
     for c in corr:
         p, q = _thin(c.p, c.q, max_corr_per_pair, sizes[c.i])
-        thin.append(Correspondences(c.i, c.j, p, q, c.weight, c.method))
+        thin.append(Correspondences(c.i, c.j, p, q, c.weight, c.method, getattr(c, "robust_px", 0.0)))
     corr = thin
 
-    init = initial_transforms(main, {e: H for e, H in pair_H.items() if e in edges_w and e[0] in main},
-                              edges_w, anchor)
+    # chain the pair transforms in the model itself: chained homographies collect
+    # perspective along a long strip, and their similarity part can then be far off
+    init = initial_transforms(main, {e: project_to_model(H, model, sizes[e[0]]) for e, H in pair_H.items()
+                                     if e in edges_w and e[0] in main}, edges_w, anchor)
     init = {n: project_to_model(init[n], model, sizes[n]) for n in main}
 
     removed = []
@@ -455,6 +471,9 @@ def run_bundle(nodes: list, corr: list, pair_H: dict, sizes: dict, model="homogr
         dropped_any = False
         for c, r in zip(corr, res):
             pm = float(np.median(r))
+            if c.method in LINK_METHODS:
+                keep.append(c)
+                continue
             if pm > thr_pair and c.method != "phasecorr":
                 removed.append({"i": c.i, "j": c.j, "median_px": round(pm, 2), "round": rnd})
                 dropped_any = True

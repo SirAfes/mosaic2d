@@ -138,6 +138,8 @@ class App:
         self.b_open = ttk.Button(bar, text="Open output folder", command=self.open_out, state="disabled")
         self.b_open.pack(side="left", padx=6)
         ttk.Button(bar, text="View a mosaic...", command=self.view).pack(side="left", padx=6)
+        self.b_asm = ttk.Button(bar, text="Assemble groups...", command=self.assemble)
+        self.b_asm.pack(side="left", padx=6)
         self.pb = ttk.Progressbar(bar, mode="indeterminate", length=160)
         self.pb.pack(side="left", padx=6)
         ttk.Label(bar, textvariable=self.v_status).pack(side="left", padx=6)
@@ -275,6 +277,31 @@ class App:
             ViewerWindow(self.root, fn)
         except Exception as e:                        # noqa: BLE001
             messagebox.showerror("mosaic2d viewer", f"Cannot open {Path(fn).name}:\n{e}")
+
+    def assemble(self):
+        """One image from the groups of a finished run (no new matching)."""
+        from tkinter import filedialog, messagebox
+        start = self.out_dir if self.out_dir and self.out_dir.exists() else (self.v_out.get() or None)
+        d = filedialog.askdirectory(title="Output folder of the run (with *_blocks.csv)", initialdir=start or None)
+        if not d:
+            return
+        if not list(Path(d).glob("*_blocks.csv")):
+            messagebox.showerror("mosaic2d", "No *_blocks.csv in that folder: choose the output folder of a run.")
+            return
+        self.out_dir = Path(d)
+        self._launch(["assemble", d])
+
+    def _launch(self, argv):
+        import time as _t
+        self.log.delete("1.0", "end")
+        self.q.put("mosaic2d " + " ".join(argv) + "\n\n")
+        self.b_run.configure(state="disabled")
+        self.b_open.configure(state="disabled")
+        self.pb.start(12)
+        self._t0 = self._last_line_t = _t.time()
+        self.v_status.set("Running...")
+        self.worker = threading.Thread(target=self._work, args=(argv,), daemon=True)
+        self.worker.start()
 
     def open_out(self):
         if not self.out_dir:

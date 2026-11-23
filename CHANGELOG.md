@@ -2,6 +2,16 @@
 
 ## 0.3.0
 
+- `mosaic2d assemble <output folder>` ("Assemble groups..." in the window): one image
+  from the separate groups of a finished run, without matching or rendering photos
+  again. The groups are taken in shooting order; from the last photos of a group the
+  net step and the turn rate of the camera path are measured (medians over thirds of
+  the last 12 photos, robust to wiggles and stray photos), the path is continued over
+  the missing photos - straight, or still turning - and the next group is put where the
+  path arrives, turned so that its own first steps follow it. The area of the missing
+  photos stays empty; inside each group nothing changes. Writes `<name>_assembled.tif`,
+  a natural-colour preview and `<name>_assembled_groups.csv` (placement of each group).
+  `--straight` continues without turning.
 - Rendering draws the mosaic one band of rows at a time into memory (at most ~400 MB)
   and writes each band to the disk canvas in one sequential piece; decoded photos are
   kept while they are still needed (up to 2 GB). Frame by frame straight into the disk

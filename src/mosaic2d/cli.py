@@ -137,6 +137,13 @@ def build_parser():
     sub.add_parser("methods", help="list feature methods")
     g = sub.add_parser("gui", help="open a window for choosing folders and options")
     g.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    asm = sub.add_parser("assemble", help="put the separate groups of a finished run into one image "
+                                          "along the continued camera path (no new matching)")
+    asm.add_argument("folder", help="output folder of the run (with <name>_blocks.csv)")
+    asm.add_argument("--name", default=None, help="run name, if the folder holds several")
+    asm.add_argument("--photos", default=None, help="photo folder (default: the folder above)")
+    asm.add_argument("--straight", action="store_true", help="continue the path straight, no turning")
+    asm.add_argument("-o", "--out", default=None, help="output TIFF (default <name>_assembled.tif)")
     pv = sub.add_parser("preview", help="natural-colour JPEG of finished mosaics (multispectral too)")
     pv.add_argument("files", nargs="+", help="mosaic TIFF(s)")
     pv.add_argument("--max-side", type=int, default=4000, help="longest side of the JPEG in px")
@@ -159,6 +166,11 @@ def main(argv=None):
     if args.cmd == "gui":
         from .gui import main as gui_main
         return gui_main(selftest=args.selftest)
+    if args.cmd == "assemble":
+        from .assemble import assemble
+        res = assemble(args.folder, name=args.name, photos=args.photos, out=args.out,
+                       straight=args.straight)
+        return 0 if res else 1
     if args.cmd == "preview":
         from .quicklook import make_preview
         bands = args.bands.split(",") if args.bands else None

@@ -2,6 +2,23 @@
 
 ## 0.3.0
 
+- Matches are checked against the photos themselves: each accepted pair is laid over
+  its partner at preview size with its own transform; if the two do not look alike
+  there (median correlation over tiles of the overlap < 0.2), the match was made on
+  repeating texture or particles and is rejected (`verify_previews`, on by default).
+  Aran 3: 148 of ~1800 matches, nearly all between different passes (24 % of those,
+  against 1-2 % of consecutive pairs); they had glued separate stretches of the
+  transect on top of each other and made photos look like a fast crossing.
+- Sequence mode: consecutive photos that no feature method matched are registered
+  from their previews (rotation search, masked normalised cross-correlation). Often
+  the camera moved almost a whole frame and they share only a ~10 % strip; unrelated
+  photos reach a correlation of 0.32 at most, pairs are accepted from 0.4. These
+  pairs are coarse (~25 px), so they carry weight (2/25)^2 and a 25 px loss and are
+  never rejected. Aran 3: 26 pairs.
+- Sequence mode: an order link now assumes the step of the pairs found that way (the
+  long steps, Aran 3: 2000 px) rather than the median matched step (500 px), and its
+  tie points sit around the middle between the two photos. The log names the pieces
+  of the main block that are held only by shooting order (their position is a guess).
 - Fix: in sequence mode, groups joined only by a "typical step" link could end up far
   from where they belong (tens of thousands of pixels; Aran 3: RMSE 766 px, 30
   consecutive photos placed far apart). The start of the adjustment chained pair

@@ -305,3 +305,121 @@ def phase_correlation_pair(img_a: np.ndarray, img_b: np.ndarray, i: int, j: int,
     res.ok = True
     res.reason = f"response {resp:.3f}, NCC {ncc:.2f}"
     return res
+
+
+# ------------------------------------------------------------ thumbnail registration
+def _highpass(img, side=300):
+    """Grey, high-passed, at most `side` px; returns (image, scale from input px)."""
+    g = img.astype(np.float32)
+    if g.ndim == 3:
+        g = g.mean(2)
+    s = min(1.0, side / max(g.shape))
+    if s < 1.0:
+        g = cv2.resize(g, (max(8, round(g.shape[1] * s)), max(8, round(g.shape[0] * s))),
+                       interpolation=cv2.INTER_AREA)
+    g = g - cv2.GaussianBlur(g, (0, 0), 6)
+    return g, s
+
+
+def masked_ncc(f, g, mg, min_overlap):
+    """
+    Normalised cross-correlation of f with g (valid pixels mg) at every shift,
+    computed only over the overlap (Padfield 2012, fixed mask all ones). Returns
+    the best (ncc, dx, dy): g's pixel (0, 0) lies at f's (dx, dy).
+    """
+    from scipy import fft as sfft
+    H1, W1 = f.shape
+    H2, W2 = g.shape
+    shp = (H1 + H2 - 1, W1 + W2 - 1)
+    fs = [sfft.next_fast_len(n) for n in shp]
+    mf = np.ones_like(f)
+    gr, mr = (g * mg)[::-1, ::-1], mg[::-1, ::-1].astype(np.float32)
+
+    def F(x):
+        return sfft.rfft2(x, fs)
+
+    def I(x):
+        return sfft.irfft2(x, fs)[:shp[0], :shp[1]]
+    Ff, Ff2, Fm = F(f), F(f * f), F(mf)
+    Gg, Gg2, Gm = F(gr), F(gr * gr), F(mr)
+    n = np.maximum(np.round(I(Fm * Gm)), 1.0)
+    sf, sg = I(Ff * Gm), I(Fm * Gg)
+    num = I(Ff * Gg) - sf * sg / n
+    den = (I(Ff2 * Gm) - sf * sf / n) * (I(Fm * Gg2) - sg * sg / n)
+    ncc = np.where((n >= min_overlap) & (den > 1e-12), num / np.sqrt(np.maximum(den, 1e-12)), -1.0)
+    y, x = np.unravel_index(int(np.argmax(ncc)), ncc.shape)
+    return float(ncc[y, x]), x - (W2 - 1), y - (H2 - 1)
+
+
+def register_thumbnails(img_a, img_b, rotations=(-12, -8, -4, 0, 4, 8, 12), min_overlap=0.15):
+    """
+    Dense registration of two small images (for photos of a sequence whose
+    features did not match - fine sand, little contrast at full resolution, but
+    shapes that still correlate when seen small). Rotation is searched in steps,
+    translation by masked normalised cross-correlation over the overlap.
+    Returns (ncc, M, overlap) with M (3x3) from img_b pixels to img_a pixels and
+    the overlap as a fraction of img_a; ncc is checked directly at the result.
+    """
+    fa, sa = _highpass(img_a)
+    fb, sb = _highpass(img_b)
+    h, w = fb.shape
+    ones = np.ones_like(fb)
+    best = (-1.0, None, 0.0)
+    for deg in rotations:
+        R = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), deg, 1.0)
+        gb = cv2.warpAffine(fb, R, (w, h))
+        mb = (cv2.warpAffine(ones, R, (w, h)) > 0.99).astype(np.float32)
+        _, dx, dy = masked_ncc(fa, gb, mb, min_overlap * fa.size)
+        M = np.vstack([R, [0, 0, 1]])
+        M[0, 2] += dx
+        M[1, 2] += dy
+        wb = cv2.warpAffine(fb, M[:2], fa.shape[::-1])
+        m = cv2.warpAffine(ones, M[:2], fa.shape[::-1]) > 0.99
+        m &= cv2.erode(np.ones_like(fa), np.ones((9, 9), np.uint8)) > 0
+        if m.sum() < min_overlap * fa.size:
+            continue
+        x, y = fa[m] - fa[m].mean(), wb[m] - wb[m].mean()
+        d = float(np.sqrt((x * x).sum() * (y * y).sum()))
+        c = float((x * y).sum() / d) if d > 0 else -1.0
+        if c > best[0]:
+            S = np.diag([sa, sa, 1.0])
+            best = (c, np.linalg.inv(S) @ M @ np.diag([sb, sb, 1.0]), float(m.sum()) / fa.size)
+    return best
+
+
+def preview_ncc(img_a, img_b, M):
+    """
+    NCC of two small images where M (3x3, img_b px -> img_a px) puts them on top
+    of each other, over the overlap; returns (ncc, overlap as a fraction of img_a).
+    """
+    fa, sa = _highpass(img_a)
+    fb, sb = _highpass(img_b)
+    A = np.diag([sa, sa, 1.0]) @ M @ np.diag([1 / sb, 1 / sb, 1.0])
+    wb = cv2.warpPerspective(fb, A, fa.shape[::-1])
+    m = cv2.warpPerspective(np.ones_like(fb), A, fa.shape[::-1]) > 0.99
+    m &= cv2.erode(np.ones_like(fa), np.ones((9, 9), np.uint8)) > 0
+    ov = float(m.sum()) / fa.size
+    if m.sum() < 500:
+        return float("nan"), ov
+    # median over tiles of the overlap: an object between camera and bottom (a
+    # floating tape, a fish) shifts between views and spoils only the tiles it
+    # covers, while photos of different seabed fail everywhere
+    h, w = fa.shape
+    t = max(24, int(round(min(h, w) / 6)))
+    vals = []
+    for y0 in range(0, h - t + 1, t):
+        for x0 in range(0, w - t + 1, t):
+            mm = m[y0:y0 + t, x0:x0 + t]
+            if mm.mean() < 0.6:
+                continue
+            x = fa[y0:y0 + t, x0:x0 + t][mm]
+            y = wb[y0:y0 + t, x0:x0 + t][mm]
+            x, y = x - x.mean(), y - y.mean()
+            d = float(np.sqrt((x * x).sum() * (y * y).sum()))
+            if d > 0:
+                vals.append(float((x * y).sum() / d))
+    if len(vals) < 3:
+        x, y = fa[m] - fa[m].mean(), wb[m] - wb[m].mean()
+        d = float(np.sqrt((x * x).sum() * (y * y).sum()))
+        return (float((x * y).sum() / d) if d > 0 else float("nan")), ov
+    return float(np.median(vals)), ov

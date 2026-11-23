@@ -98,12 +98,14 @@ def H_from_theta(th: np.ndarray, model: str) -> np.ndarray:
 
 
 # Tie points of these methods are assumptions, not measurements (sequence mode:
-# "consecutive photos are one typical step apart"), so they are never rejected.
-# Their loss is set per set of tie points (Correspondences.robust_px): a link that
-# is the only connection of a group is quadratic (inf) - a Cauchy loss would give
-# up on it as soon as the group hanging on it starts far off, and the group would
-# stay wherever it started - the others have a wide Cauchy loss.
+# "consecutive photos are one typical step apart"). A link is the only connection
+# of a group, so its loss is quadratic (Correspondences.robust_px = inf): a Cauchy
+# loss would give up on it as soon as the group hanging on it starts far off, and
+# the group would stay wherever it started.
 LINK_METHODS = ("sequence",)
+# never rejected by the pair test: links, and coarse measurements (registration of
+# small previews, ~25 px) that carry a small weight and their own wide loss instead
+KEEP_METHODS = ("sequence", "thumbnail")
 
 
 @dataclass
@@ -471,7 +473,7 @@ def run_bundle(nodes: list, corr: list, pair_H: dict, sizes: dict, model="homogr
         dropped_any = False
         for c, r in zip(corr, res):
             pm = float(np.median(r))
-            if c.method in LINK_METHODS:
+            if c.method in KEEP_METHODS:
                 keep.append(c)
                 continue
             if pm > thr_pair and c.method != "phasecorr":

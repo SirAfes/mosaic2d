@@ -227,7 +227,7 @@ def run_camera_bundle(nodes, corr, pair_H, sizes, focal_px, focal_sigma=0.3, dis
             off += 2 * n
             ep = np.maximum(e_ij, e_ji)
             pm = float(np.median(ep))
-            if c.method in BA.LINK_METHODS:          # an assumption, not a measurement: keep
+            if c.method in BA.KEEP_METHODS:          # an assumption or a coarse measurement: keep
                 keep_c.append(c)
                 continue
             if pm > thr_pair and c.method != "phasecorr":

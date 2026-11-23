@@ -66,6 +66,7 @@ class Settings:
     window: int = 3                  # sequential neighbours
     sequence: bool = False           # photos in shooting order: neighbours matched harder, gaps bridged
     sequence_max_gap: int = 3        # longest run of unmatched photos that is bridged
+    verify_previews: bool = True     # reject matches whose photos do not look alike (preview NCC)
     quick: bool = False              # fewer alternatives (see --quick)
     lens_from: str | None = None     # report.json / project.pkl of an earlier run: reuse its lens calibration
     distortion: bool = True          # self-calibrate radial distortion k1, k2
@@ -658,14 +659,16 @@ class Project:
             self.log(f"  sharpness inside the frame varies {np.exp(np.ptp(field)):.1f}x "
                      f"across the frame (accounted for)")
         # photos placed only from the shooting order: any matched photo is better there
-        real = set()
+        real, coarse = set(), set()
         for (i, j), r in self.pairs.items():
             if r.ok:
-                real |= {i, j}
+                (coarse if r.method == "thumbnail" else real).update((i, j))
         for i, j in getattr(self, "sequence_links", []):
             for k in (i, j):
-                if k not in real:
+                if k not in real and k not in coarse:
                     self.frames[k].quality = min(self.frames[k].quality, 0.3)
+        for k in coarse - real:                 # placed from previews only (~25 px)
+            self.frames[k].quality = min(self.frames[k].quality, 0.5)
         low = [f.path.name for f in self.frames if f.quality < 0.5]
         if low:
             self.log(f"  {len(low)} blurred frame(s) (sharpness < 0.5 x median, from overlaps): "
@@ -916,7 +919,13 @@ class Project:
             q = r.pts_j / sj
             Hn = np.diag([1 / sj, 1 / sj, 1]) @ r.H @ np.diag([si, si, 1])
             w = 0.3 if r.method == "phasecorr" else 1.0
-            corr.append(BA.Correspondences(i, j, p, q, w, r.method))
+            rob = 0.0
+            if r.method == "thumbnail":
+                # registered from small previews: ~25 px uncertainty instead of ~2 px, so a
+                # weight of (2/25)^2 and a loss of that width - it holds a photo that has
+                # nothing else, but cannot pull against matched features
+                w, rob = 0.01, 25.0
+            corr.append(BA.Correspondences(i, j, p, q, w, r.method, rob))
             pairH[(i, j)] = Hn
         self.sequence_links = []
         if getattr(self.s, "sequence", False):
@@ -927,21 +936,33 @@ class Project:
         """
         Sequence mode: where neighbours in the shooting order are not connected by
         any matched pair (featureless sand, blur, a turn), add a weak link that
-        assumes the typical step between consecutive photos (median shift of the
-        matched neighbours, no rotation or scale change). Only links that join two
+        assumes a long step between consecutive photos (see below; no rotation or
+        scale change). Only links that join two
         separate groups are added, so matched geometry is not touched; photos placed
         this way are listed in the log and lose overlaps to matched photos.
         """
         n = len(self.frames)
-        steps = []
+        steps, coarse = [], []
+        kind = {(c.i, c.j): c.method for c in corr}
         for (i, j), H in pairH.items():
             if j == i + 1:
                 w, h = sizes[i]
                 c = np.array([[[w / 2.0, h / 2.0]]])
-                steps.append(cv2.perspectiveTransform(c, H)[0, 0] - c[0, 0])
-        if not steps:
+                v = cv2.perspectiveTransform(c, H)[0, 0] - c[0, 0]
+                (coarse if kind.get((i, j)) == "thumbnail" else steps).append(v)
+        if not steps and not coarse:
             return corr, pairH
-        step = np.median(np.array(steps), axis=0)
+        # Consecutive photos that no method matched are mostly the ones the camera
+        # moved furthest between (Aran 3: 2000 px against a median of 500 px for
+        # matched ones), so a link takes the step of the pairs that only the preview
+        # registration found - just beyond what features can match - or, without
+        # enough of those, the long end of the matched steps (90th percentile).
+        if len(coarse) >= 5:
+            step = np.median(np.array(coarse), axis=0)
+        else:
+            st = np.array(steps)
+            med = np.median(st, axis=0)
+            step = med / max(float(np.hypot(*med)), 1e-9) * float(np.percentile(np.hypot(st[:, 0], st[:, 1]), 90))
         # photos without any real match: bridged only in short runs (a blurred photo or
         # two between good ones). Long runs (camera moving fast, turbid water, a turn)
         # would be placed by dead reckoning over many steps - far off, a huge canvas and
@@ -976,18 +997,16 @@ class Project:
             if root(i) == root(j) or i in excluded or j in excluded:
                 continue
             w, h = sizes[i]
-            g = np.array([[x, y] for x in np.linspace(0.1, 0.9, 5) * w for y in np.linspace(0.1, 0.9, 4) * h])
+            # tie points around the middle between the two photo centres (inside both
+            # photos as long as the step is shorter than a photo)
+            g = np.array([w / 2.0, h / 2.0]) - step / 2.0 + np.array(
+                [[x, y] for x in np.linspace(-0.2, 0.2, 5) * w for y in np.linspace(-0.2, 0.2, 4) * h])
             q = g + step
-            wj, hj = sizes[j]
-            ok = (q[:, 0] > 0) & (q[:, 0] < wj) & (q[:, 1] > 0) & (q[:, 1] < hj)
-            if ok.sum() < 6:                        # typical step leaves no overlap: assume half a frame
-                q = g + step * (0.5 * min(w, h) / max(1e-6, float(np.hypot(*step))))
-                ok = (q[:, 0] > 0) & (q[:, 0] < wj) & (q[:, 1] > 0) & (q[:, 1] < hj)
             # the only connection of a group: quadratic loss, so it holds the group
             # wherever the group starts (links between photos that are connected
             # otherwise were tried: where the swimmer sped up they pull matched
             # geometry apart)
-            corr.append(BA.Correspondences(i, j, g[ok], q[ok], 0.05, "sequence", float("inf")))
+            corr.append(BA.Correspondences(i, j, g, q, 0.05, "sequence", float("inf")))
             T = np.array([[1, 0, step[0]], [0, 1, step[1]], [0, 0, 1]], np.float64)
             pairH[(i, j)] = T
             parent[root(i)] = root(j)
@@ -1003,11 +1022,134 @@ class Project:
                               for i, j in self.sequence_links[:10])
             more = " ..." if len(self.sequence_links) > 10 else ""
             self.log(f"  sequence: {len(self.sequence_links)} gap(s) between consecutive photos bridged "
-                     f"by the typical step ({step[0]:+.0f}, {step[1]:+.0f}) px: {names}{more}")
+                     f"by a step of ({step[0]:+.0f}, {step[1]:+.0f}) px: {names}{more}")
         return corr, pairH
+
+    def _preview(self, fr):
+        if getattr(fr, "seam_img", None) is not None and np.size(fr.seam_img):
+            return np.asarray(fr.seam_img), fr.seam_scale
+        if getattr(fr, "thumb", None) is not None and np.size(fr.thumb):
+            return np.asarray(fr.thumb), fr.thumb_scale
+        return None, None
+
+    def verify_by_previews(self, min_gap=3, max_ncc=0.2, min_overlap=0.15):
+        """
+        Features can match between photos that do not show the same seabed
+        (repeating texture, a fish, particles): the transform is then consistent
+        but the photos do not look alike where it puts them on top of each other.
+        Each accepted pair is laid over its partner with its own transform at
+        preview size; if they overlap by at least min_overlap and correlate below
+        max_ncc, the pair is rejected. (Aran 3: 23 % of the matches between passes
+        failed this, 2 % of those between consecutive photos - so photos less than
+        min_gap apart are rejected only if their previews fit together clearly
+        better elsewhere.)
+        Each pair is checked once. Returns the number rejected.
+        """
+        if not getattr(self.s, "verify_previews", True):
+            return 0
+        bad = []
+        for (i, j), r in self.pairs.items():
+            if not r.ok or r.method == "thumbnail" or getattr(r, "preview_checked", False):
+                continue
+            r.preview_checked = True
+            ia, sa = self._preview(self.frames[i])
+            ib, sb = self._preview(self.frames[j])
+            if ia is None or ib is None or r.H is None:
+                continue
+            ki = self.frames[i].work_scale / sa          # preview px -> working px
+            kj = self.frames[j].work_scale / sb
+            try:
+                M = np.diag([1 / ki, 1 / ki, 1.0]) @ np.linalg.inv(r.H) @ np.diag([kj, kj, 1.0])
+            except np.linalg.LinAlgError:
+                continue
+            c, ov = MT.preview_ncc(ia, ib, M)
+            if not (ov >= min_overlap and np.isfinite(c) and c < max_ncc):
+                continue
+            if abs(j - i) < min_gap:
+                # near neighbours: a blurred preview can fail too, so the match is only
+                # dropped where the previews clearly fit together somewhere else
+                c2, _, ov2 = MT.register_thumbnails(ia, ib, rotations=tuple(range(-180, 180, 10)),
+                                                    min_overlap=0.08)
+                if not (c2 >= 0.4 and c2 > c + 0.2):
+                    continue
+                if j == i + 1:                  # the preview registration replaces it below
+                    r.tried = [t for t in (r.tried or []) if t != "thumbnail"]
+            r.ok = False
+            r.reason = f"photos do not look alike where the match puts them (preview NCC {c:.2f})"
+            bad.append((i, j))
+        if bad:
+            names = ", ".join(f"{self.frames[i].path.stem}-{self.frames[j].path.stem}" for i, j in bad[:6])
+            self.log(f"  {len(bad)} matched pair(s) rejected: the photos do not look alike where the "
+                     f"match puts them on top of each other (repeating texture?): {names}"
+                     f"{' ...' if len(bad) > 6 else ''}")
+        return len(bad)
+
+    def sequence_register(self, min_ncc=0.4, min_overlap=0.08):
+        """
+        Sequence mode: consecutive photos whose features did not match are
+        registered once more by dense correlation of their small previews (fine
+        sand and blur leave too few features at full resolution, while the shapes
+        still correlate when seen small), and the camera often moved almost a whole
+        frame between them, so they share only a narrow strip (~10 %). Accepted at
+        NCC >= min_ncc over at least min_overlap of the photo: unrelated photos of
+        this seabed reach 0.32 at most. Each pair is tried once (marked "thumbnail"
+        in its tried list). Returns pairs added.
+        """
+        if not getattr(self.s, "sequence", False):
+            return 0
+        added = []
+        for i in range(len(self.frames) - 1):
+            j = i + 1
+            old = self.pairs.get((i, j))
+            if old is not None and (old.ok or "thumbnail" in (old.tried or [])):
+                continue
+            fa, fb = self.frames[i], self.frames[j]
+            ia, sa = self._preview(fa)
+            ib, sb = self._preview(fb)
+            tried = list(old.tried) if old is not None and old.tried else []
+            tried.append("thumbnail")
+            if ia is None or ib is None or not np.size(ia) or not np.size(ib):
+                if old is not None:
+                    old.tried = tried
+                continue
+            c, M, ov = MT.register_thumbnails(np.asarray(ia), np.asarray(ib), min_overlap=min_overlap)
+            ok = M is not None and c >= min_ncc
+            if ok:
+                hb, wb = np.asarray(ib).shape[:2]
+                ha, wa = np.asarray(ia).shape[:2]
+                d = M @ [wb / 2.0, hb / 2.0, 1.0] - [wa / 2.0, ha / 2.0, 1.0]
+                ok = float(np.hypot(d[0], d[1])) > 0.002 * np.hypot(wa, ha)   # not a fixed pattern
+            if not ok:
+                if old is not None:
+                    old.tried = tried
+                else:
+                    self.pairs[(i, j)] = MT.PairResult(i, j, "thumbnail", False, tried=tried,
+                                                    reason=f"thumbnail NCC {c:.2f} < {min_ncc}")
+                continue
+            gx, gy = np.meshgrid(np.linspace(0.02, 0.98, 25) * wb, np.linspace(0.05, 0.95, 12) * hb)
+            pb = np.stack([gx.ravel(), gy.ravel()], 1)
+            pa = cv2.perspectiveTransform(pb[None], M)[0]
+            inside = (pa[:, 0] > 0) & (pa[:, 0] < wa) & (pa[:, 1] > 0) & (pa[:, 1] < ha)
+            if inside.sum() < 6:
+                continue
+            pa, pb = pa[inside], pb[inside]
+            ki, kj = fa.work_scale / sa, fb.work_scale / sb       # preview px -> working px
+            Hw = np.diag([kj, kj, 1.0]) @ np.linalg.inv(M) @ np.diag([1 / ki, 1 / ki, 1.0])
+            self.pairs[(i, j)] = MT.PairResult(
+                i, j, "thumbnail", True, H=Hw, pts_i=pa * ki, pts_j=pb * kj, n_matches=len(pa),
+                n_inliers=len(pa), inlier_ratio=1.0, coverage=float(ov), rmse=0.0,
+                reason=f"thumbnail NCC {c:.2f}", tried=tried)
+            added.append((i, j))
+        if added:
+            names = ", ".join(f"{self.frames[i].path.stem}-{self.frames[j].path.stem}" for i, j in added[:8])
+            self.log(f"  sequence: {len(added)} consecutive pair(s) without feature matches registered "
+                     f"from their previews: {names}{' ...' if len(added) > 8 else ''}")
+        return len(added)
 
     def adjust(self):
         t = time.time()
+        self.verify_by_previews()
+        self.sequence_register()
         corr, pairH, sizes = self._corr()
         nodes = [f.index for f in self.frames]
         if not corr:
@@ -1024,6 +1166,21 @@ class Project:
         self.log(f"  adjustment: {n_main}/{len(nodes)} images in the main block, "
                  f"RMSE {r.rmse_px:.2f} px, median {r.median_px:.2f} px, "
                  f"k1={r.k[0]:+.4f} k2={r.k[1]:+.4f}, anchor {self.frames[r.anchor].path.name}")
+        self.sequence_groups = []
+        if self.sequence_links:
+            main = set(r.components[0])
+            removed = {(d["i"], d["j"]) for d in r.removed_pairs}
+            edges = [(c.i, c.j) for c in corr if c.method not in BA.LINK_METHODS
+                     and c.i in main and c.j in main and (c.i, c.j) not in removed]
+            sub = sorted(BA.connected_components(sorted(main), edges), key=len, reverse=True)
+            self.sequence_groups = [sorted(g) for g in sub]
+            if len(sub) > 1:
+                big = [g for g in sub[1:] if len(g) >= 3]
+                desc = ", ".join(f"{len(g)} ({self.frames[min(g)].path.stem} ...)" for g in big[:8])
+                self.log(f"  sequence: the main block holds {len(sub) - 1} piece(s) without any matched "
+                         f"overlap with the rest, placed by shooting order only - their position is "
+                         f"approximate (consecutive photos there do not overlap)"
+                         + (f"; larger ones: {desc}" if desc else ""))
         self.timing["adjustment_s"] = self.timing.get("adjustment_s", 0) + time.time() - t
 
     def _check_camera(self, r):
@@ -1702,6 +1859,9 @@ class Project:
             "image_quality": {f.path.name: round(f.quality, 3) for f in self.frames},
             "sequence_links": [[self.frames[i].path.name, self.frames[j].path.name]
                                for i, j in getattr(self, "sequence_links", [])],
+            "sequence_pieces_in_main_block": [len(g) for g in getattr(self, "sequence_groups", [])],
+            "pairs_from_previews": [[self.frames[i].path.name, self.frames[j].path.name]
+                                    for (i, j), pr in self.pairs.items() if pr.ok and pr.method == "thumbnail"],
             "timing_s": {k: round(v, 1) for k, v in self.timing.items()},
         }
         cam = getattr(r, "camera", None) if r else None

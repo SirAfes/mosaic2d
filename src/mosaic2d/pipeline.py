@@ -1590,7 +1590,8 @@ class Project:
                          flat=getattr(self, "flat", None), seams=self.s.seams,
                          deghost=self.s.deghost, feather=getattr(self.s, "feather", True),
                          vis_bands=getattr(self, "_vis_auto", None) or self.vis_channels(),
-                         progress=lambda k, n: (k % 5 == 0 or k == n) and self.log(f"  rendered {k}/{n} frames"))
+                         progress=lambda k, n, y=None, h=None: self.log(
+                             f"  rendered {k}/{n} frames" + (f" ({100 * y / h:.0f} % of the rows)" if h else "")))
         prof = self.prof
 
         def load(fr):

@@ -33,6 +33,7 @@ average   feather-weighted average of all frames at every pixel (smooth, but
 from __future__ import annotations
 
 import os
+from collections import OrderedDict
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,6 +156,22 @@ def _remap_multi(img, mx, my, interp=cv2.INTER_LINEAR, border=cv2.BORDER_CONSTAN
     return np.concatenate(parts, axis=2)
 
 
+class _RowView:
+    """Rows [Y0, Y0 + len(buf)) of the canvas, held in ``buf``, addressed in canvas rows."""
+
+    def __init__(self, buf, Y0):
+        self.buf, self.Y0 = buf, Y0
+        self.shape = (Y0 + buf.shape[0],) + buf.shape[1:]
+
+    def __getitem__(self, key):
+        ys, xs = key
+        return self.buf[ys.start - self.Y0:ys.stop - self.Y0, xs]
+
+    def __setitem__(self, key, val):
+        ys, xs = key
+        self.buf[ys.start - self.Y0:ys.stop - self.Y0, xs] = val
+
+
 class _SeamAccumulator:
     """
     Sparse float accumulator for the narrow feathering band along seamlines.
@@ -244,6 +261,13 @@ class _SeamAccumulator:
                     blk[m] = np.clip(v, 1, maxv).astype(dtype)
                     self.n_flushed += 1
                 out[y0:y0 + h, xa:xb] = band
+
+    def flush_rows(self, buf, Y0, Y1, maxv, dtype):
+        """Blend every accumulated tile inside rows [Y0, Y1) into ``buf`` (those rows)."""
+        t = self.t
+        keys = [k for k in self.tiles if Y0 <= k[0] * t < Y1]
+        if keys:
+            self._write(_RowView(buf, Y0), keys, maxv, dtype)
 
     def flush_done(self, out, n, maxv, dtype):
         """Write the tiles no frame after number n can touch."""
@@ -574,102 +598,134 @@ class Renderer:
         # 'disabled' keeps every pixel value exactly as in one source frame)
         feathering = (self.feather and self.blend == "mosaic" and self.seams is not None
                       and bool(self.seams.soft))
-        seam_acc = None
-        if feathering:
-            # per 32-px tile: the last frame (in drawing order) whose box covers it
-            t = 32
-            last = np.full((-(-self.H // t), -(-self.W // t)), -1, np.int32)
-            for n_, fr in enumerate(self.frames):
-                x0, y0, x1, y1 = fr.bbox
-                if x1 > x0 and y1 > y0:
-                    last[max(0, y0) // t:(y1 - 1) // t + 1, max(0, x0) // t:(x1 - 1) // t + 1] = n_
-            seam_acc = _SeamAccumulator(self.B, t, last)
+        seam_acc = _SeamAccumulator(self.B, 32) if feathering else None
 
+        # Band-major drawing: the canvas is filled one band of rows at a time, in a
+        # buffer in memory, and written to the disk canvas in one sequential piece.
+        # Frame-major drawing (each photo straight into the disk canvas) touched the
+        # whole multi-GB file again and again; on a hard disk it got slower with every
+        # photo (Aran Island: 13 s per photo at the start, 90 s at the end).
+        row_bytes = self.W * self.B * self.dtype.itemsize
+        band_h = int(np.clip(getattr(self, "band_bytes", 384e6) // max(row_bytes, 1), 32, 4096)) // 32 * 32 or 32
+        if self.blend == "average":
+            band_h = self.H                     # average blending keeps its own disk arrays
+        order = {fr.index: n for n, fr in enumerate(self.frames)}
+        live = [fr for fr in self.frames if fr.bbox[2] > fr.bbox[0] and fr.bbox[3] > fr.bbox[1]]
+        cache: OrderedDict = OrderedDict()      # decoded photos, least recently used first
+        cache_bytes = [0]
+        cache_max = 2.0e9
+
+        def lenses_of(fr):
+            hit = cache.get(fr.index)
+            if hit is not None:
+                cache.move_to_end(fr.index)
+                return hit
+            ln = load_lenses(fr)
+            nb = sum(a.nbytes for a in ln.values())
+            cache[fr.index] = ln
+            cache_bytes[0] += nb
+            while cache_bytes[0] > cache_max and len(cache) > 1:
+                _, old = cache.popitem(last=False)
+                cache_bytes[0] -= sum(a.nbytes for a in old.values())
+            return ln
+
+        per_frame = {}
         step, block_w = 4, 512
-        for n, fr in enumerate(self.frames):
-            x0, y0, x1, y1 = fr.bbox
-            if x1 <= x0 or y1 <= y0:
-                continue
-            lenses = None
-            others = self._others(fr)
-            Ainv = {ln: np.linalg.inv(fr.lens_A[ln]) for ln in fr.lens_A}
-            # blocks of strip x block_w px; a coarse pass first skips blocks this frame
-            # neither wins nor feathers (most of a frame with 5-10x overlap)
-            for ys in range(y0, y1, self.strip):
-                ye = min(y1, ys + self.strip)
-                for xs in range(x0, x1, block_w):
-                    xe = min(x1, xs + block_w)
-                    valid_c, lose_c, Xc, Yc = self._lose_coarse(fr, others, xs, xe, ys, ye, step)
-                    if not valid_c.any():
-                        continue
-                    need = valid_c & ~lose_c
-                    wf_c = self.seams.weight(fr.index, Xc, Yc) if feathering else None
-                    if wf_c is not None:
-                        need |= valid_c & (wf_c > 0.002) & (wf_c < 0.998)
-                    if not (cv2.dilate(need.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)[1:-1, 1:-1].any():
-                        continue
-                    X, Y = np.meshgrid(np.arange(xs, xe, dtype=np.float64),
-                                       np.arange(ys, ye, dtype=np.float64))
-                    u, v = _map(fr, X, Y)
-                    s, valid, ud, vd = _score(fr, u, v, self.dist)
-                    if not valid.any():
-                        continue
-                    if self.blend == "average":
-                        sel = valid
-                    else:
-                        sel = valid & ~self._upsample(lose_c, step, *X.shape)
-                    band = None
-                    if wf_c is not None:
-                        wf = self.seams.weight(fr.index, X, Y)
-                        band = valid & (wf > 0.002) & (wf < 0.998)
-                        if not band.any():
-                            band = None
-                    region = sel if band is None else (sel | band)
-                    if not region.any():
-                        continue
-                    if lenses is None:
-                        lenses = load_lenses(fr)
-                    rows = np.where(region.any(1))[0]
-                    cols = np.where(region.any(0))[0]
-                    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
-                    sel = sel[r0:r1, c0:c1]
-                    udc, vdc = ud[r0:r1, c0:c1], vd[r0:r1, c0:c1]
-                    vals = np.zeros(sel.shape + (self.B,), np.float32)
-                    for ln, A in Ainv.items():
-                        bands = [b for b, (bl, _) in enumerate(self.band_sources) if bl == ln]
-                        if not bands:
+        done = 0
+        for Y0 in range(0, self.H, band_h):
+            Y1 = min(self.H, Y0 + band_h)
+            buf = None if self.blend == "average" else np.zeros((Y1 - Y0, self.W, self.B), self.dtype)
+            for fr in live:
+                x0, y0, x1, y1 = fr.bbox
+                if y1 <= Y0 or y0 >= Y1:
+                    continue
+                if fr.index not in per_frame:
+                    per_frame[fr.index] = (self._others(fr),
+                                           {ln: np.linalg.inv(fr.lens_A[ln]) for ln in fr.lens_A})
+                others, Ainv = per_frame[fr.index]
+                for ys in range(max(y0, Y0), min(y1, Y1), self.strip):
+                    ye = min(y1, Y1, ys + self.strip)
+                    for xs in range(x0, x1, block_w):
+                        xe = min(x1, xs + block_w)
+                        valid_c, lose_c, Xc, Yc = self._lose_coarse(fr, others, xs, xe, ys, ye, step)
+                        if not valid_c.any():
                             continue
-                        mx = (A[0, 0] * udc + A[0, 1] * vdc + A[0, 2]).astype(np.float32)
-                        my = (A[1, 0] * udc + A[1, 1] * vdc + A[1, 2]).astype(np.float32)
-                        img = lenses[ln]
-                        chans = [self.band_sources[b][1] for b in bands]
-                        sub = img[..., chans] if img.ndim == 3 else img[..., None]
-                        r = _remap_multi(np.ascontiguousarray(sub), mx, my)
-                        vals[..., bands] = r
-                    Xb, Yb = X[r0:r1, c0:c1], Y[r0:r1, c0:c1]
-                    if self.flat is not None:
-                        vals /= np.maximum(self._flat_at(fr, udc, vdc), 0.05)
-                    if self.blend == "mosaic" and fr.index in self.gain:  # two-band blending
-                        vals *= self._gain_at(fr, Xb, Yb)
-                    oy, ox = ys + r0, xs + c0
-                    if self.blend == "average":
-                        w = _cheb_weight(fr, udc, vdc) * sel + 1e-6 * sel
-                        acc[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += vals * w[..., None]
-                        wsum[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += w
-                    else:
-                        tgt = out[oy:oy + sel.shape[0], ox:ox + sel.shape[1]]
-                        v = np.clip(vals, 1, self.maxv).astype(self.dtype)
-                        tgt[sel] = v[sel]
-                        if band is not None:
-                            seam_acc.add(oy, ox, band[r0:r1, c0:c1], vals, wf[r0:r1, c0:c1])
-            del lenses
-            if seam_acc is not None:
-                seam_acc.flush_done(out, n, self.maxv, self.dtype)
+                        need = valid_c & ~lose_c
+                        wf_c = self.seams.weight(fr.index, Xc, Yc) if feathering else None
+                        if wf_c is not None:
+                            need |= valid_c & (wf_c > 0.002) & (wf_c < 0.998)
+                        if not (cv2.dilate(need.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0)[1:-1, 1:-1].any():
+                            continue
+                        X, Y = np.meshgrid(np.arange(xs, xe, dtype=np.float64),
+                                           np.arange(ys, ye, dtype=np.float64))
+                        u, v = _map(fr, X, Y)
+                        sc, valid, ud, vd = _score(fr, u, v, self.dist)
+                        if not valid.any():
+                            continue
+                        if self.blend == "average":
+                            sel = valid
+                        else:
+                            sel = valid & ~self._upsample(lose_c, step, *X.shape)
+                        band = None
+                        if wf_c is not None:
+                            wf = self.seams.weight(fr.index, X, Y)
+                            band = valid & (wf > 0.002) & (wf < 0.998)
+                            if not band.any():
+                                band = None
+                        region = sel if band is None else (sel | band)
+                        if not region.any():
+                            continue
+                        lenses = lenses_of(fr)
+                        rows = np.where(region.any(1))[0]
+                        cols = np.where(region.any(0))[0]
+                        r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+                        sel = sel[r0:r1, c0:c1]
+                        udc, vdc = ud[r0:r1, c0:c1], vd[r0:r1, c0:c1]
+                        vals = np.zeros(sel.shape + (self.B,), np.float32)
+                        for ln, A in Ainv.items():
+                            bands = [b for b, (bl, _) in enumerate(self.band_sources) if bl == ln]
+                            if not bands:
+                                continue
+                            mx = (A[0, 0] * udc + A[0, 1] * vdc + A[0, 2]).astype(np.float32)
+                            my = (A[1, 0] * udc + A[1, 1] * vdc + A[1, 2]).astype(np.float32)
+                            img = lenses[ln]
+                            chans = [self.band_sources[b][1] for b in bands]
+                            sub = img[..., chans] if img.ndim == 3 else img[..., None]
+                            vals[..., bands] = _remap_multi(np.ascontiguousarray(sub), mx, my)
+                        Xb, Yb = X[r0:r1, c0:c1], Y[r0:r1, c0:c1]
+                        if self.flat is not None:
+                            vals /= np.maximum(self._flat_at(fr, udc, vdc), 0.05)
+                        if self.blend == "mosaic" and fr.index in self.gain:  # two-band blending
+                            vals *= self._gain_at(fr, Xb, Yb)
+                        oy, ox = ys + r0, xs + c0
+                        if self.blend == "average":
+                            w = _cheb_weight(fr, udc, vdc) * sel + 1e-6 * sel
+                            acc[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += vals * w[..., None]
+                            wsum[oy:oy + sel.shape[0], ox:ox + sel.shape[1]] += w
+                        else:
+                            tgt = buf[oy - Y0:oy - Y0 + sel.shape[0], ox:ox + sel.shape[1]]
+                            vv = np.clip(vals, 1, self.maxv).astype(self.dtype)
+                            tgt[sel] = vv[sel]
+                            if band is not None:
+                                seam_acc.add(oy, ox, band[r0:r1, c0:c1], vals, wf[r0:r1, c0:c1])
+            if buf is not None:
+                if seam_acc is not None:
+                    seam_acc.flush_rows(buf, Y0, Y1, self.maxv, self.dtype)
+                out[Y0:Y1] = buf
+                del buf
+            # photos whose last band is done are no longer needed
+            for fr in live:
+                if Y0 < fr.bbox[3] <= Y1 or (Y1 == self.H and fr.bbox[3] > Y1):
+                    done += 1
+                    old = cache.pop(fr.index, None)
+                    if old is not None:
+                        cache_bytes[0] -= sum(a.nbytes for a in old.values())
+                    per_frame.pop(fr.index, None)
             if self.progress:
-                self.progress(n + 1, len(self.frames))
+                self.progress(done, len(live), Y1, self.H)
+        del order
         if seam_acc is not None:
-            n = seam_acc.flush(out, self.maxv, self.dtype)
-            self.log(f"  seamlines feathered ({n} tiles of 32 px)")
+            self.log(f"  seamlines feathered ({seam_acc.n_flushed} tiles of 32 px)")
         if self.blend == "average":
             for ys in range(0, self.H, self.strip):
                 w = np.asarray(wsum[ys:ys + self.strip])

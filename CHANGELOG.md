@@ -2,6 +2,12 @@
 
 ## 0.3.0
 
+- Rendering draws the mosaic one band of rows at a time into memory (at most ~400 MB)
+  and writes each band to the disk canvas in one sequential piece; decoded photos are
+  kept while they are still needed (up to 2 GB). Frame by frame straight into the disk
+  canvas got slower with every photo on a hard disk (Aran Island, 446 photos, 44 GB:
+  13 s per photo at the start, 93 s per photo at the end, 5.6 h in all). The log shows
+  the share of rows done.
 - Large series (more than 600 photos): pairs between photos far apart in the series are
   found by feature voting (every thumbnail feature votes for the photo its nearest
   neighbour comes from; each photo's best partners are verified) instead of not being

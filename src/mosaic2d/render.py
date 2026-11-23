@@ -587,11 +587,16 @@ class Renderer:
                  f"{need / 1e9:.2f} GB ({self.blend} blending)")
         canvas_path = self.work_dir / f"{out_name}.canvas"
         self.canvas_path = canvas_path
-        out = sparse_memmap(canvas_path, self.dtype, shape)
-        acc = wsum = None
+        acc = wsum = out = None
         if self.blend == "average":
+            out = sparse_memmap(canvas_path, self.dtype, shape)
             acc = sparse_memmap(self.work_dir / "acc.f32", np.float32, shape)
             wsum = sparse_memmap(self.work_dir / "wsum.f32", np.float32, shape[:2])
+            fh_out = None
+        else:
+            # rows are produced in order: plain sequential file writes, no memory map
+            # (writing through a memory map into a sparse NTFS file was very slow)
+            fh_out = open(canvas_path, "wb")
         if not self.gain and self.seams is None:
             self.prepare()
         # narrow feathering across optimised seamlines (two-band blending only;
@@ -711,7 +716,7 @@ class Renderer:
             if buf is not None:
                 if seam_acc is not None:
                     seam_acc.flush_rows(buf, Y0, Y1, self.maxv, self.dtype)
-                out[Y0:Y1] = buf
+                fh_out.write(np.ascontiguousarray(buf).tobytes())
                 del buf
             # photos whose last band is done are no longer needed
             for fr in live:
@@ -724,6 +729,9 @@ class Renderer:
             if self.progress:
                 self.progress(done, len(live), Y1, self.H)
         del order
+        if fh_out is not None:
+            fh_out.close()
+            out = np.memmap(canvas_path, dtype=self.dtype, mode="r+", shape=shape)
         if seam_acc is not None:
             self.log(f"  seamlines feathered ({seam_acc.n_flushed} tiles of 32 px)")
         if self.blend == "average":
